@@ -1,0 +1,65 @@
+// Test sample for amalgame-framework-crypto.
+//
+// Imports the Amalgame.Crypto module + uses Sha256 / Hmac
+// classes to verify that the extracted facade produces correct
+// FIPS 180-4 / RFC 2104 outputs against published test vectors.
+//
+// Note: avoid the bare keyword "ns"+"pace" in comments — see the
+// encoding sample for the rationale.
+
+namespace UserApp
+
+import Amalgame.Crypto
+import Amalgame.Collections
+
+public class Program {
+    public static void Main() {
+        // ── SHA-256 of "" (NIST CAVP empty vector) ────
+        let empty: string = Sha256.OfString("")
+        if (empty == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") {
+            Console.WriteLine("[PASS] sha256 empty")
+        } else {
+            Console.WriteLine("[FAIL] sha256 empty got '" + empty + "'")
+        }
+
+        // ── SHA-256 of "abc" (FIPS 180-4 Appendix B.1) ─
+        let abc: string = Sha256.OfString("abc")
+        if (abc == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") {
+            Console.WriteLine("[PASS] sha256 abc")
+        } else {
+            Console.WriteLine("[FAIL] sha256 abc got '" + abc + "'")
+        }
+
+        // ── HMAC-SHA-256 — RFC 4231 Test Case 1 ───────
+        // key   = 0x0b * 20 (20 bytes of 0x0b)
+        // data  = "Hi There"
+        // hmac  = b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7
+        let key: List<int> = new List<int>()
+        for i in 0..20 {
+            key.Add(11) // 0x0b
+        }
+        let msg: List<int> = new List<int>()
+        msg.Add(72)  // H
+        msg.Add(105) // i
+        msg.Add(32)  // space
+        msg.Add(84)  // T
+        msg.Add(104) // h
+        msg.Add(101) // e
+        msg.Add(114) // r
+        msg.Add(101) // e
+        let h: string = Hmac.Sha256Hex(key, msg)
+        if (h == "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7") {
+            Console.WriteLine("[PASS] hmac rfc4231 tc1")
+        } else {
+            Console.WriteLine("[FAIL] hmac got '" + h + "'")
+        }
+
+        // ── HMAC convenience: OfStrings ───────────────
+        let h2: string = Hmac.Sha256OfStrings("key", "The quick brown fox jumps over the lazy dog")
+        if (h2 == "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8") {
+            Console.WriteLine("[PASS] hmac fox")
+        } else {
+            Console.WriteLine("[FAIL] hmac fox got '" + h2 + "'")
+        }
+    }
+}

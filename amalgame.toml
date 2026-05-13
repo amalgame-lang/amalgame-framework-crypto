@@ -1,0 +1,33 @@
+# Package manifest — amalgame-crypto
+#
+# Pure-Amalgame crypto facade — SHA-256 (FIPS 180-4) and
+# HMAC-SHA-256 (RFC 2104) primitives. Originally bundled in amc's
+# src/stdlib/crypto.am; extracted into this external package as
+# part of the framework split (project F follow-up, amc >= 0.7.5).
+#
+# Installation:
+#
+#   amc package add crypto                  # via curated index
+#   amc package add github.com/amalgame-lang/amalgame-crypto@v0.1.0
+#
+# At install time amc precompiles `facade.am` into
+# `<pkg-cache>/build/<platform>/libamalgame-pkg-Crypto.a` (PR #377
+# infra). User builds then auto-pass `--external facade.am` and
+# auto-link the archive.
+
+[package]
+name              = "amalgame-crypto"
+version           = "0.1.0"
+license           = "Apache-2.0"
+description       = "Pure-Amalgame crypto facade: SHA-256 (FIPS 180-4) + HMAC-SHA-256 (RFC 2104)."
+authors           = ["Bastien Mouget"]
+required-amalgame = ">=0.7.6"
+schema-version    = 1
+
+[stdlib]
+# Primary class. The facade also exposes Hmac as a sibling class
+# under the same namespace, accessible after `import Amalgame.Crypto`.
+class     = "Sha256"
+header    = "facade-stub.h"
+namespace = "Amalgame.Crypto"
+facade    = "facade.am"
