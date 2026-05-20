@@ -33,6 +33,7 @@ import Amalgame.Collections
     #include <stdint.h>
     #include <string.h>
     #include <openssl/evp.h>
+    #include <openssl/rand.h>
 
     /* SHA-256 core (FIPS 180-4 §6.2). Block size 64 bytes,
      * output 32 bytes, 8×32-bit state words H0..H7. */
@@ -570,5 +571,54 @@ public class Aead {
             }
         }
         return res
+    }
+
+    // ── Seal with a freshly-generated nonce (v0.2.1) ──
+    // The safe default. Generates a 12-byte nonce via OpenSSL's
+    // crypto-grade RAND_bytes and packs it at the front of the
+    // output, so callers can never accidentally reuse a (key,
+    // nonce) pair — the #1 way AES-GCM gets catastrophically
+    // broken in practice.
+    //
+    // Wire layout: nonce(12) || ciphertext(plen) || tag(16)
+    // Total size: 28 + plen bytes.
+    //
+    // Decrypt with `OpenAes256GcmAuto` (splits the nonce off the
+    // front transparently).
+    //
+    // Returns empty list on internal OpenSSL failure (RAND_bytes
+    // refused entropy, GCM seal failed, or wrong key length).
+    public static List<int> SealAes256GcmAuto(key: List<int>, aad: List<int>, plaintext: List<int>) {
+        var out: List<int> = new List<int>()
+        @c {
+            size_t klen; uint8_t* kbuf = amalgame_crypto_list_to_bytes(key, &klen);
+            size_t alen; uint8_t* abuf = amalgame_crypto_list_to_bytes(aad, &alen);
+            size_t plen; uint8_t* pbuf = amalgame_crypto_list_to_bytes(plaintext, &plen);
+            uint8_t nonce[12];
+            if (klen == 32 && RAND_bytes(nonce, 12) == 1) {
+                uint8_t* bundle = (uint8_t*) GC_MALLOC_ATOMIC(12 + plen + 16);
+                memcpy(bundle, nonce, 12);
+                if (amalgame_crypto_aes256_gcm_seal(kbuf, nonce, abuf, alen, pbuf, plen, bundle + 12)) {
+                    out = amalgame_crypto_bytes_to_list(bundle, 12 + plen + 16);
+                }
+            }
+        }
+        return out
+    }
+
+    // ── Open a SealAes256GcmAuto bundle (v0.2.1) ─────
+    // Splits the nonce off the front and delegates to
+    // OpenAes256Gcm. Returns Ok=false on any malformed input
+    // (bundle shorter than 28 bytes / tag mismatch / wrong key).
+    public static AeadResult OpenAes256GcmAuto(key: List<int>, aad: List<int>, bundle: List<int>) {
+        let res = new AeadResult()
+        let n: int = bundle.Count()
+        // Need at least nonce(12) + tag(16) = 28 bytes.
+        if (n < 28) { return res }
+        let nonce: List<int> = new List<int>()
+        for i in 0..12 { nonce.Add(bundle.Get(i)) }
+        let ct: List<int> = new List<int>()
+        for j in 12..n { ct.Add(bundle.Get(j)) }
+        return Aead.OpenAes256Gcm(key, nonce, aad, ct)
     }
 }

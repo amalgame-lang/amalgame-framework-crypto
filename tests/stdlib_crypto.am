@@ -150,5 +150,66 @@ public class Program {
         } else {
             Console.WriteLine("[FAIL] aead accepted wrong AAD")
         }
+
+        // ── v0.2.1: SealAes256GcmAuto round-trip ───────
+        // Auto bundles a fresh nonce inside the output, so this is
+        // the safe default — impossible to reuse a (key, nonce) pair.
+        let autoSealed: List<int> = Aead.SealAes256GcmAuto(zeroKey, aad, pt)
+        // 12 (nonce) + 5 (pt) + 16 (tag) = 33 bytes
+        if (autoSealed.Count() == 33) {
+            Console.WriteLine("[PASS] aead auto seal length")
+        } else {
+            Console.WriteLine("[FAIL] aead auto length: " + String_FromInt(autoSealed.Count()))
+        }
+
+        let autoOpened: AeadResult = Aead.OpenAes256GcmAuto(zeroKey, aad, autoSealed)
+        if (autoOpened.Ok
+            && autoOpened.Plaintext.Count() == 5
+            && autoOpened.Plaintext.Get(0) == 72) {
+            Console.WriteLine("[PASS] aead auto roundtrip")
+        } else {
+            Console.WriteLine("[FAIL] aead auto roundtrip lost data")
+        }
+
+        // Two Auto seals MUST differ (fresh nonce per call). If they
+        // were identical the underlying RAND_bytes would be broken.
+        let autoA: List<int> = Aead.SealAes256GcmAuto(zeroKey, aad, pt)
+        let autoB: List<int> = Aead.SealAes256GcmAuto(zeroKey, aad, pt)
+        var differ: bool = false
+        for k in 0..12 {
+            if (autoA.Get(k) != autoB.Get(k)) { differ = true }
+        }
+        if (differ) {
+            Console.WriteLine("[PASS] aead auto uses fresh nonce")
+        } else {
+            Console.WriteLine("[FAIL] aead auto reused nonce — RAND_bytes broken?")
+        }
+
+        // Tampered Auto bundle rejected.
+        let tamperedAuto: List<int> = new List<int>()
+        for tt in 0..autoSealed.Count() {
+            var bb: int = autoSealed.Get(tt)
+            if (tt == 13) {     // first ciphertext byte (after 12-byte nonce)
+                bb = bb + 1
+                if (bb > 255) { bb = 0 }
+            }
+            tamperedAuto.Add(bb)
+        }
+        let tampRes: AeadResult = Aead.OpenAes256GcmAuto(zeroKey, aad, tamperedAuto)
+        if (!tampRes.Ok) {
+            Console.WriteLine("[PASS] aead auto tamper rejected")
+        } else {
+            Console.WriteLine("[FAIL] aead auto tamper accepted")
+        }
+
+        // Too-short bundle rejected (< 28 bytes).
+        let shortBundle: List<int> = new List<int>()
+        for ss in 0..20 { shortBundle.Add(0) }
+        let shortRes: AeadResult = Aead.OpenAes256GcmAuto(zeroKey, aad, shortBundle)
+        if (!shortRes.Ok) {
+            Console.WriteLine("[PASS] aead auto short bundle rejected")
+        } else {
+            Console.WriteLine("[FAIL] aead auto accepted short bundle")
+        }
     }
 }

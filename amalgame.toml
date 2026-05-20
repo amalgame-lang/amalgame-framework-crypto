@@ -17,7 +17,7 @@
 
 [package]
 name              = "amalgame-crypto"
-version           = "0.2.0"
+version           = "0.2.1"
 license           = "Apache-2.0"
 description       = "Crypto facade for Amalgame: SHA-256 (FIPS 180-4) + HMAC-SHA-256 (RFC 2104) + AES-256-GCM AEAD (NIST SP 800-38D)."
 authors           = ["Bastien Mouget"]
