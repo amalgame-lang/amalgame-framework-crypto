@@ -61,5 +61,94 @@ public class Program {
         } else {
             Console.WriteLine("[FAIL] hmac fox got '" + h2 + "'")
         }
+
+        // ─────────────────────────────────────────────────
+        // v0.2 — AES-256-GCM AEAD
+        // ─────────────────────────────────────────────────
+
+        // Build a 32-byte key and 12-byte nonce of all-zeroes.
+        // For the all-zero key+nonce + empty plaintext + empty AAD,
+        // NIST SP 800-38D + reference vectors give a known tag:
+        //   tag = 0x530f8afbc74536b9a963b4f1c4cb738b
+        let zeroKey: List<int> = new List<int>()
+        for i in 0..32 { zeroKey.Add(0) }
+        let zeroNonce: List<int> = new List<int>()
+        for j in 0..12 { zeroNonce.Add(0) }
+        let emptyAad: List<int> = new List<int>()
+        let emptyPt:  List<int> = new List<int>()
+
+        let sealedEmpty: List<int> = Aead.SealAes256Gcm(zeroKey, zeroNonce, emptyAad, emptyPt)
+        if (sealedEmpty.Count() == 16) {
+            // Verify the known-answer tag (16 bytes for empty plaintext).
+            let want = new List<int>()
+            want.Add(83);  want.Add(15);  want.Add(138); want.Add(251)
+            want.Add(199); want.Add(69);  want.Add(54);  want.Add(185)
+            want.Add(169); want.Add(99);  want.Add(180); want.Add(241)
+            want.Add(196); want.Add(203); want.Add(115); want.Add(139)
+            var eq: bool = true
+            for k in 0..16 {
+                if (sealedEmpty.Get(k) != want.Get(k)) { eq = false }
+            }
+            if (eq) {
+                Console.WriteLine("[PASS] aead aes256gcm empty KAT")
+            } else {
+                Console.WriteLine("[FAIL] aead empty tag mismatch")
+            }
+        } else {
+            Console.WriteLine("[FAIL] aead empty wrong length: " + String_FromInt(sealedEmpty.Count()))
+        }
+
+        // ── Roundtrip: encrypt then decrypt ───────────
+        let pt: List<int> = new List<int>()
+        pt.Add(72)  // H
+        pt.Add(101) // e
+        pt.Add(108) // l
+        pt.Add(108) // l
+        pt.Add(111) // o
+        let aad: List<int> = new List<int>()
+        aad.Add(1); aad.Add(2); aad.Add(3)
+        let sealed: List<int> = Aead.SealAes256Gcm(zeroKey, zeroNonce, aad, pt)
+        if (sealed.Count() == 21) {     // 5 plaintext + 16 tag
+            Console.WriteLine("[PASS] aead sealed length")
+        } else {
+            Console.WriteLine("[FAIL] aead sealed length got " + String_FromInt(sealed.Count()))
+        }
+        let opened: AeadResult = Aead.OpenAes256Gcm(zeroKey, zeroNonce, aad, sealed)
+        if (opened.Ok
+            && opened.Plaintext.Count() == 5
+            && opened.Plaintext.Get(0) == 72
+            && opened.Plaintext.Get(4) == 111) {
+            Console.WriteLine("[PASS] aead roundtrip Hello")
+        } else {
+            Console.WriteLine("[FAIL] aead roundtrip lost data")
+        }
+
+        // ── Tag mismatch: corrupt a byte in the ciphertext ─
+        let tampered: List<int> = new List<int>()
+        for t in 0..sealed.Count() {
+            var b: int = sealed.Get(t)
+            if (t == 0) {
+                // Replace with (b+1) mod 256 — guaranteed to differ.
+                b = b + 1
+                if (b > 255) { b = 0 }
+            }
+            tampered.Add(b)
+        }
+        let badRes: AeadResult = Aead.OpenAes256Gcm(zeroKey, zeroNonce, aad, tampered)
+        if (!badRes.Ok) {
+            Console.WriteLine("[PASS] aead tag mismatch rejected")
+        } else {
+            Console.WriteLine("[FAIL] aead accepted tampered ct")
+        }
+
+        // ── Wrong AAD also fails the tag ─────────────
+        let wrongAad: List<int> = new List<int>()
+        wrongAad.Add(9); wrongAad.Add(9); wrongAad.Add(9)
+        let wrongAadRes: AeadResult = Aead.OpenAes256Gcm(zeroKey, zeroNonce, wrongAad, sealed)
+        if (!wrongAadRes.Ok) {
+            Console.WriteLine("[PASS] aead wrong-AAD rejected")
+        } else {
+            Console.WriteLine("[FAIL] aead accepted wrong AAD")
+        }
     }
 }

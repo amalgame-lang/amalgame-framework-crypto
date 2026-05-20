@@ -32,6 +32,7 @@ import Amalgame.Collections
 @c {
     #include <stdint.h>
     #include <string.h>
+    #include <openssl/evp.h>
 
     /* SHA-256 core (FIPS 180-4 §6.2). Block size 64 bytes,
      * output 32 bytes, 8×32-bit state words H0..H7. */
@@ -232,6 +233,83 @@ import Amalgame.Collections
         buf[2*len] = 0;
         return buf;
     }
+
+    /* ── AES-256-GCM AEAD (v0.2.0) ──────────────────────
+     * Thin wrapper around OpenSSL EVP. Key = 32 bytes (256-bit),
+     * Nonce = 12 bytes (96-bit, GCM-recommended), Tag = 16 bytes
+     * (128-bit, full GCM tag). Output layout: ciphertext || tag,
+     * same wire shape as Go's `crypto/cipher.Seal` and libsodium's
+     * crypto_aead_aes256gcm_encrypt. AAD (additional authenticated
+     * data) participates in the tag but isn't encrypted — pass an
+     * empty buffer if unused.
+     *
+     * Nonce safety: GCM is catastrophically broken on nonce reuse
+     * with the same key (both messages' keystreams XOR-cancel and
+     * the auth key leaks). Callers MUST never reuse a nonce; use
+     * `Random.SystemBytes(12)` for each Seal call. */
+    static int amalgame_crypto_aes256_gcm_seal(
+        const uint8_t* key,    /* 32 bytes */
+        const uint8_t* nonce,  /* 12 bytes */
+        const uint8_t* aad, size_t aad_len,
+        const uint8_t* pt,  size_t pt_len,
+        uint8_t* out           /* pt_len + 16 bytes */
+    ) {
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        if (!ctx) return 0;
+        int ok = 0;
+        int outl = 0;
+        do {
+            if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) break;
+            if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL)) break;
+            if (1 != EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce)) break;
+            if (aad_len > 0) {
+                if (1 != EVP_EncryptUpdate(ctx, NULL, &outl, aad, (int) aad_len)) break;
+            }
+            if (1 != EVP_EncryptUpdate(ctx, out, &outl, pt, (int) pt_len)) break;
+            int total = outl;
+            if (1 != EVP_EncryptFinal_ex(ctx, out + total, &outl)) break;
+            total += outl;
+            if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, out + total)) break;
+            ok = 1;
+        } while (0);
+        EVP_CIPHER_CTX_free(ctx);
+        return ok;
+    }
+
+    /* Verify + decrypt. Returns 1 on success (tag valid), 0 on tag
+     * mismatch or any malformed input. `out_pt` must be at least
+     * `ct_tag_len - 16` bytes; nothing is written on failure. */
+    static int amalgame_crypto_aes256_gcm_open(
+        const uint8_t* key,    /* 32 bytes */
+        const uint8_t* nonce,  /* 12 bytes */
+        const uint8_t* aad, size_t aad_len,
+        const uint8_t* ct_tag, size_t ct_tag_len,  /* >= 16 */
+        uint8_t* out_pt
+    ) {
+        if (ct_tag_len < 16) return 0;
+        size_t ct_len = ct_tag_len - 16;
+        const uint8_t* tag = ct_tag + ct_len;
+
+        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+        if (!ctx) return 0;
+        int ok = 0;
+        int outl = 0;
+        do {
+            if (1 != EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) break;
+            if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL)) break;
+            if (1 != EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce)) break;
+            if (aad_len > 0) {
+                if (1 != EVP_DecryptUpdate(ctx, NULL, &outl, aad, (int) aad_len)) break;
+            }
+            if (1 != EVP_DecryptUpdate(ctx, out_pt, &outl, ct_tag, (int) ct_len)) break;
+            if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16, (void*) tag)) break;
+            int finalLen = 0;
+            if (1 != EVP_DecryptFinal_ex(ctx, out_pt + outl, &finalLen)) break;
+            ok = 1;
+        } while (0);
+        EVP_CIPHER_CTX_free(ctx);
+        return ok;
+    }
 }
 
 public class Sha256 {
@@ -318,5 +396,179 @@ public class Hmac {
             out = amalgame_crypto_bytes_to_hex(digest, 32);
         }
         return out
+    }
+}
+
+// ── Bytes — string / bytes / hex conversion helpers ───
+//
+// AEAD callers routinely need to convert plain strings to
+// List<int> (for SealAes256Gcm input), and bytes back to hex for
+// transport. Sha256.Bytes / Hex already cover the digest path;
+// these helpers cover the symmetric/AEAD path.
+//
+// All entries in returned byte lists are in [0, 255]. HexToBytes
+// returns an empty list on malformed input (odd length, non-hex
+// char); callers detect this by checking Count() against the
+// expected output length.
+public class Bytes {
+    public Bytes() {}
+
+    // UTF-8 byte view of `s`. Amalgame strings are already
+    // char* of UTF-8 in the runtime, so this is a straight copy.
+    public static List<int> FromString(s: string) {
+        var out: List<int> = new List<int>()
+        @c {
+            if (!s) s = "";
+            size_t len = strlen(s);
+            out = amalgame_crypto_bytes_to_list((const uint8_t*) s, len);
+        }
+        return out
+    }
+
+    // Bytes back to a NUL-terminated string. Caller is responsible
+    // for ensuring the bytes form valid UTF-8 if downstream code
+    // expects that.
+    public static string ToString(b: List<int>) {
+        var out: string = ""
+        @c {
+            size_t len; uint8_t* buf = amalgame_crypto_list_to_bytes(b, &len);
+            char* s = (char*) GC_MALLOC(len + 1);
+            memcpy(s, buf, len);
+            s[len] = 0;
+            out = s;
+        }
+        return out
+    }
+
+    // Lowercase hex of all bytes.
+    public static string ToHex(b: List<int>) {
+        var out: string = ""
+        @c {
+            size_t len; uint8_t* buf = amalgame_crypto_list_to_bytes(b, &len);
+            out = amalgame_crypto_bytes_to_hex(buf, len);
+        }
+        return out
+    }
+
+    // Parse a lowercase OR uppercase hex string into bytes.
+    // Returns an empty list on odd length / non-hex char.
+    public static List<int> FromHex(h: string) {
+        var out: List<int> = new List<int>()
+        @c {
+            if (!h) h = "";
+            size_t n = strlen(h);
+            if (n % 2 != 0) {
+                /* leave out empty */
+            } else {
+                size_t bytes_len = n / 2;
+                uint8_t* buf = (uint8_t*) GC_MALLOC_ATOMIC(bytes_len > 0 ? bytes_len : 1);
+                int ok = 1;
+                for (size_t i = 0; i < bytes_len; i++) {
+                    char ch1 = h[2*i], ch2 = h[2*i+1];
+                    int hi, lo;
+                    if      (ch1 >= '0' && ch1 <= '9') hi = ch1 - '0';
+                    else if (ch1 >= 'a' && ch1 <= 'f') hi = ch1 - 'a' + 10;
+                    else if (ch1 >= 'A' && ch1 <= 'F') hi = ch1 - 'A' + 10;
+                    else { ok = 0; break; }
+                    if      (ch2 >= '0' && ch2 <= '9') lo = ch2 - '0';
+                    else if (ch2 >= 'a' && ch2 <= 'f') lo = ch2 - 'a' + 10;
+                    else if (ch2 >= 'A' && ch2 <= 'F') lo = ch2 - 'A' + 10;
+                    else { ok = 0; break; }
+                    buf[i] = (uint8_t)((hi << 4) | lo);
+                }
+                if (ok) {
+                    out = amalgame_crypto_bytes_to_list(buf, bytes_len);
+                }
+            }
+        }
+        return out
+    }
+}
+
+// ── AeadResult — return type for `Aead.OpenAes256Gcm` ───
+// AM containers are never null, so we can't signal auth failure
+// by returning a null list. The Ok bool disambiguates an empty
+// plaintext from a tag-mismatch.
+public class AeadResult {
+    public Ok:        bool
+    public Plaintext: List<int>
+
+    public AeadResult() {
+        this.Ok        = false
+        this.Plaintext = new List<int>()
+    }
+}
+
+// ── Aead — authenticated encryption with associated data ──
+// Single algorithm in v0.2: AES-256-GCM (NIST SP 800-38D), the
+// industry-default AEAD. 256-bit key, 96-bit nonce, 128-bit tag.
+//
+// Output layout: ciphertext || tag — same wire shape as Go's
+// `crypto/cipher.Seal` and libsodium's AES-256-GCM. Length of
+// ciphertext equals length of plaintext (GCM is a stream cipher
+// internally), so the total output is `len(plaintext) + 16`.
+//
+// **Nonce safety:** AES-GCM is catastrophically broken when the
+// same (key, nonce) pair is reused — both messages' keystreams
+// XOR-cancel and the authentication key leaks. Callers MUST use
+// a fresh random 96-bit nonce per Seal call. `Random.SystemBytes(12)`
+// from amalgame-random does the right thing.
+public class Aead {
+    public Aead() {}
+
+    // Seal: encrypt + authenticate. Inputs are byte lists.
+    //   key       — 32 bytes (256-bit AES key)
+    //   nonce     — 12 bytes (96-bit GCM IV; MUST be unique per key)
+    //   aad       — additional data, participates in the tag but
+    //               isn't encrypted. Empty list = no AAD.
+    //   plaintext — message bytes to encrypt
+    // Returns ciphertext || tag (length = len(plaintext) + 16).
+    // Returns empty list on internal OpenSSL failure (rare —
+    // out-of-memory or wrong key/nonce length).
+    public static List<int> SealAes256Gcm(key: List<int>, nonce: List<int>, aad: List<int>, plaintext: List<int>) {
+        var out: List<int> = new List<int>()
+        @c {
+            size_t klen; uint8_t* kbuf = amalgame_crypto_list_to_bytes(key, &klen);
+            size_t nlen; uint8_t* nbuf = amalgame_crypto_list_to_bytes(nonce, &nlen);
+            size_t alen; uint8_t* abuf = amalgame_crypto_list_to_bytes(aad, &alen);
+            size_t plen; uint8_t* pbuf = amalgame_crypto_list_to_bytes(plaintext, &plen);
+            if (klen != 32 || nlen != 12) {
+                /* leave out as empty list — caller treats as failure */
+            } else {
+                uint8_t* obuf = (uint8_t*) GC_MALLOC_ATOMIC(plen + 16);
+                if (amalgame_crypto_aes256_gcm_seal(kbuf, nbuf, abuf, alen, pbuf, plen, obuf)) {
+                    out = amalgame_crypto_bytes_to_list(obuf, plen + 16);
+                }
+            }
+        }
+        return out
+    }
+
+    // Open: verify tag + decrypt. Inputs are byte lists.
+    //   key             — 32 bytes
+    //   nonce           — 12 bytes (same nonce used by Seal)
+    //   aad             — must match what was Sealed
+    //   ciphertext_tag  — Seal's output (ct || tag, >= 16 bytes)
+    // Returns AeadResult: Ok=true with the decrypted plaintext on
+    // success, Ok=false with empty plaintext on tag mismatch or
+    // malformed input. The bool is the only way to distinguish
+    // "auth failed" from "auth succeeded but plaintext is empty".
+    public static AeadResult OpenAes256Gcm(key: List<int>, nonce: List<int>, aad: List<int>, ciphertext_tag: List<int>) {
+        let res = new AeadResult()
+        @c {
+            size_t klen; uint8_t* kbuf = amalgame_crypto_list_to_bytes(key, &klen);
+            size_t nlen; uint8_t* nbuf = amalgame_crypto_list_to_bytes(nonce, &nlen);
+            size_t alen; uint8_t* abuf = amalgame_crypto_list_to_bytes(aad, &alen);
+            size_t clen; uint8_t* cbuf = amalgame_crypto_list_to_bytes(ciphertext_tag, &clen);
+            if (klen == 32 && nlen == 12 && clen >= 16) {
+                size_t ptlen = clen - 16;
+                uint8_t* pbuf = (uint8_t*) GC_MALLOC_ATOMIC(ptlen > 0 ? ptlen : 1);
+                if (amalgame_crypto_aes256_gcm_open(kbuf, nbuf, abuf, alen, cbuf, clen, pbuf)) {
+                    res->Ok = 1;
+                    res->Plaintext = amalgame_crypto_bytes_to_list(pbuf, ptlen);
+                }
+            }
+        }
+        return res
     }
 }

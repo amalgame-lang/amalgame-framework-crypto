@@ -85,7 +85,7 @@ echo "  runtime: $AMC_RUNTIME"
 # Avoid going through `amc package add` (no published tag in CI).
 FAKE_CACHE="$BUILD_DIR/cache"
 PKG_GIT="github.com/amalgame-lang/amalgame-crypto"
-PKG_TAG="${PKG_TAG:-v0.1.0}"
+PKG_TAG="${PKG_TAG:-v0.2.0}"
 FAKE_SHA="deadbeefcafebabe0000000000000000000000ab"
 SHORT_SHA="${FAKE_SHA:0:8}"
 PKG_CACHE_DIR="$FAKE_CACHE/$PKG_GIT/${PKG_TAG}_${SHORT_SHA}"
@@ -165,7 +165,7 @@ run_test() {
     fi
     local gcc_log
     gcc_log=$(gcc -O2 -I"$AMC_RUNTIME" "$out_base.c" "$ARCHIVE" \
-        -lgc -lm -lcurl -lz -ldl -lpthread -o "$out_base" 2>&1)
+        -lgc -lm -lcurl -lz -ldl -lpthread -lcrypto -o "$out_base" 2>&1)
     if [ ! -x "$out_base" ]; then
         echo -e "${RED}FAIL${NC} (gcc link failed)"
         echo "$gcc_log" | head -5 | sed 's/^/    /'
@@ -190,6 +190,11 @@ run_test "sha256 empty"                 "[PASS] sha256 empty"
 run_test "sha256 abc"                   "[PASS] sha256 abc"
 run_test "hmac RFC 4231 TC1"            "[PASS] hmac rfc4231 tc1"
 run_test "hmac fox"                     "[PASS] hmac fox"
+run_test "aead empty KAT"               "[PASS] aead aes256gcm empty KAT"
+run_test "aead sealed length"           "[PASS] aead sealed length"
+run_test "aead roundtrip"               "[PASS] aead roundtrip Hello"
+run_test "aead tampered ct rejected"    "[PASS] aead tag mismatch rejected"
+run_test "aead wrong AAD rejected"      "[PASS] aead wrong-AAD rejected"
 
 # ── Cleanup the symlinked build dir to leave the tree clean ──
 rm -f "$WORK_BUILD_DIR"

@@ -17,17 +17,23 @@
 
 [package]
 name              = "amalgame-crypto"
-version           = "0.1.0"
+version           = "0.2.0"
 license           = "Apache-2.0"
-description       = "Pure-Amalgame crypto facade: SHA-256 (FIPS 180-4) + HMAC-SHA-256 (RFC 2104)."
+description       = "Crypto facade for Amalgame: SHA-256 (FIPS 180-4) + HMAC-SHA-256 (RFC 2104) + AES-256-GCM AEAD (NIST SP 800-38D)."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.7.6"
 schema-version    = 1
 
 [stdlib]
-# Primary class. The facade also exposes Hmac as a sibling class
-# under the same namespace, accessible after `import Amalgame.Crypto`.
-class     = "Sha256"
+# v0.1.0 — Sha256 + Hmac (pure-AM via @c {} blocks).
+# v0.2.0 — Aead + AeadResult (AES-256-GCM via OpenSSL EVP).
+classes   = ["Sha256", "Hmac", "Aead", "AeadResult", "Bytes"]
 header    = "facade-stub.h"
 namespace = "Amalgame.Crypto"
 facade    = "facade.am"
+
+# v0.2.0: link libcrypto for AES-256-GCM (EVP_aes_256_gcm).
+# OpenSSL is already in the dependency tree of every Mosaic app
+# (amalgame-tls links it for TLS), so this doesn't enlarge the
+# external footprint.
+libs      = ["crypto"]
