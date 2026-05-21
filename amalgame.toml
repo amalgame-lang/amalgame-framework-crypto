@@ -17,9 +17,9 @@
 
 [package]
 name              = "amalgame-crypto"
-version           = "0.2.1"
+version           = "0.3.0"
 license           = "Apache-2.0"
-description       = "Crypto facade for Amalgame: SHA-256 (FIPS 180-4) + HMAC-SHA-256 (RFC 2104) + AES-256-GCM AEAD (NIST SP 800-38D)."
+description       = "Crypto facade for Amalgame: SHA-256, HMAC-SHA-256, AES-256-GCM AEAD, ES256/RS256 JWS signing (RFC 7515)."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.7.6"
 schema-version    = 1
@@ -27,7 +27,8 @@ schema-version    = 1
 [stdlib]
 # v0.1.0 — Sha256 + Hmac (pure-AM via @c {} blocks).
 # v0.2.0 — Aead + AeadResult (AES-256-GCM via OpenSSL EVP).
-classes   = ["Sha256", "Hmac", "Aead", "AeadResult", "Bytes"]
+# v0.3.0 — JwsKey (ES256 / RS256 signing + verification for JWS / ACME).
+classes   = ["Sha256", "Hmac", "Aead", "AeadResult", "Bytes", "JwsKey"]
 header    = "facade-stub.h"
 namespace = "Amalgame.Crypto"
 facade    = "facade.am"

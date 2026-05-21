@@ -200,6 +200,18 @@ run_test "aead auto roundtrip"          "[PASS] aead auto roundtrip"
 run_test "aead auto fresh nonce"        "[PASS] aead auto uses fresh nonce"
 run_test "aead auto tamper rejected"    "[PASS] aead auto tamper rejected"
 run_test "aead auto short rejected"     "[PASS] aead auto short bundle rejected"
+# ── v0.3.0 — base64url + JwsKey ─────────────────────────
+run_test "base64url RFC 4648"           "[PASS] base64url RFC 4648 vectors"
+run_test "base64url roundtrip"          "[PASS] base64url roundtrip"
+run_test "jws es256 generate"           "[PASS] jws es256 generate"
+run_test "jws es256 sig length"         "[PASS] jws es256 sig length 64"
+run_test "jws es256 verify"             "[PASS] jws es256 verify"
+run_test "jws es256 tamper rejected"    "[PASS] jws es256 tamper rejected"
+run_test "jws es256 jwk shape"          "[PASS] jws es256 jwk canonical shape"
+run_test "jws es256 thumbprint"         "[PASS] jws es256 thumbprint length 43"
+run_test "jws es256 pem header"         "[PASS] jws es256 pem header"
+run_test "jws es256 pem roundtrip"      "[PASS] jws es256 pem roundtrip"
+run_test "jws rs256 sign+verify"        "[PASS] jws rs256 sign+verify"
 
 # ── Cleanup the symlinked build dir to leave the tree clean ──
 rm -f "$WORK_BUILD_DIR"
