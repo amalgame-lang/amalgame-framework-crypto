@@ -27,7 +27,7 @@ jobs:
       - name: Install system deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y libgc-dev libcurl4-openssl-dev
+          sudo apt-get install -y libgc-dev libssl-dev libcurl4-openssl-dev
 
       - name: Download amc ${{ matrix.amc-tag }}
         run: |
@@ -38,8 +38,8 @@ jobs:
             "https://github.com/amalgame-lang/Amalgame/releases/download/${TAG}/amc-${VERSION}-linux-x86_64.tar.gz"
           mkdir -p $RUNNER_TEMP/amc-install
           tar -xzf amc.tar.gz -C $RUNNER_TEMP/amc-install --strip-components=1
-          echo "AMC=$RUNNER_TEMP/amc-install/amc" >> $GITHUB_ENV
-          echo "AMC_RUNTIME=$RUNNER_TEMP/amc-install/runtime" >> $GITHUB_ENV
+          echo "AMC=$RUNNER_TEMP/amc-install/bin/amc" >> $GITHUB_ENV
+          echo "AMC_RUNTIME=$RUNNER_TEMP/amc-install/share/amalgame/runtime" >> $GITHUB_ENV
 
       - name: Verify amc
         run: $AMC --version
