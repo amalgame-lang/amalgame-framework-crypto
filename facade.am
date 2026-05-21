@@ -1,6 +1,7 @@
 namespace Amalgame.Crypto
 
 import Amalgame.Collections
+import Amalgame.String
 
 // ── Crypto ────────────────────────────────────────────
 //
@@ -32,8 +33,14 @@ import Amalgame.Collections
 @c {
     #include <stdint.h>
     #include <string.h>
+    #include <stdio.h>
     #include <openssl/evp.h>
     #include <openssl/rand.h>
+    #include <openssl/ec.h>
+    #include <openssl/rsa.h>
+    #include <openssl/bn.h>
+    #include <openssl/pem.h>
+    #include <openssl/err.h>
 
     /* SHA-256 core (FIPS 180-4 §6.2). Block size 64 bytes,
      * output 32 bytes, 8×32-bit state words H0..H7. */
@@ -311,6 +318,327 @@ import Amalgame.Collections
         EVP_CIPHER_CTX_free(ctx);
         return ok;
     }
+
+    /* ── JwsKey backing primitives (v0.3.0) ─────────────────
+     * EVP_PKEY-backed signing for ES256 (ECDSA P-256 + SHA-256,
+     * RFC 7518 §3.4) and RS256 (RSASSA-PKCS1-v1_5 with SHA-256,
+     * RFC 7518 §3.3). These are the two algorithms ACME (RFC 8555)
+     * uses for account signing; ES256 is the de facto default
+     * because the keys are tiny (32-byte private, 64-byte public)
+     * and signatures are short (64 bytes raw).
+     *
+     * Lifetime: keys live for the program's lifetime. The AM
+     * facade hands a GC-rooted opaque pointer (cast to i64) to AM
+     * code; we never EVP_PKEY_free them. ACME apps create at most
+     * one account key per process, so the leak is bounded and
+     * far cheaper than tracking ownership across the AM/C boundary
+     * for a feature that has no transient-key workload.
+     *
+     * Wire format for Sign output:
+     *   ES256 — raw R||S concatenation (64 bytes), NOT the DER
+     *           Sequence(R, S) that OpenSSL ECDSA_do_sign returns.
+     *           RFC 7515 §3.4 mandates this.
+     *   RS256 — PKCS#1 v1.5 padded signature (RSA modulus length —
+     *           256 bytes for RSA-2048). RFC 7518 §3.3.
+     */
+
+    /* ES256: generate a fresh P-256 keypair. Returns NULL on failure. */
+    static EVP_PKEY* amalgame_crypto_jws_gen_es256(void) {
+        EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
+        if (!pctx) return NULL;
+        EVP_PKEY* pkey = NULL;
+        do {
+            if (EVP_PKEY_keygen_init(pctx) <= 0) break;
+            if (EVP_PKEY_CTX_set_ec_paramgen_curve_nid(pctx, NID_X9_62_prime256v1) <= 0) break;
+            if (EVP_PKEY_keygen(pctx, &pkey) <= 0) { pkey = NULL; break; }
+        } while (0);
+        EVP_PKEY_CTX_free(pctx);
+        return pkey;
+    }
+
+    /* RS256: generate a fresh RSA-2048 key. Returns NULL on failure.
+     * 2048 is the minimum modern minimum (NIST SP 800-131A "Future
+     * Use"); ACME CAs require it. */
+    static EVP_PKEY* amalgame_crypto_jws_gen_rs256(void) {
+        EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+        if (!pctx) return NULL;
+        EVP_PKEY* pkey = NULL;
+        do {
+            if (EVP_PKEY_keygen_init(pctx) <= 0) break;
+            if (EVP_PKEY_CTX_set_rsa_keygen_bits(pctx, 2048) <= 0) break;
+            if (EVP_PKEY_keygen(pctx, &pkey) <= 0) { pkey = NULL; break; }
+        } while (0);
+        EVP_PKEY_CTX_free(pctx);
+        return pkey;
+    }
+
+    /* Encode an EVP_PKEY as PEM PKCS#8 (unencrypted private key).
+     * Caller-allocatable: returns a GC-allocated NUL-terminated C
+     * string suitable as an AM `code_string` field. Returns ""
+     * on failure. */
+    static code_string amalgame_crypto_jws_to_pem(EVP_PKEY* pkey) {
+        if (!pkey) return "";
+        BIO* bio = BIO_new(BIO_s_mem());
+        if (!bio) return "";
+        code_string out = "";
+        do {
+            if (!PEM_write_bio_PKCS8PrivateKey(bio, pkey,
+                    NULL, NULL, 0, NULL, NULL)) break;
+            BUF_MEM* mem = NULL;
+            BIO_get_mem_ptr(bio, &mem);
+            if (!mem || !mem->data) break;
+            char* s = (char*) GC_MALLOC(mem->length + 1);
+            memcpy(s, mem->data, mem->length);
+            s[mem->length] = 0;
+            out = s;
+        } while (0);
+        BIO_free(bio);
+        return out;
+    }
+
+    /* Parse a PKCS#8 PEM into an EVP_PKEY. Returns NULL on parse
+     * failure or unsupported key type. */
+    static EVP_PKEY* amalgame_crypto_jws_from_pem(const char* pem) {
+        if (!pem || !pem[0]) return NULL;
+        BIO* bio = BIO_new_mem_buf(pem, -1);
+        if (!bio) return NULL;
+        EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+        BIO_free(bio);
+        return pkey;
+    }
+
+    /* Detect whether an EVP_PKEY is EC (→ ES256) or RSA (→ RS256).
+     * Returns "ES256", "RS256", or "" for anything else. */
+    static code_string amalgame_crypto_jws_algorithm(EVP_PKEY* pkey) {
+        if (!pkey) return "";
+        int id = EVP_PKEY_id(pkey);
+        if (id == EVP_PKEY_EC)  return "ES256";
+        if (id == EVP_PKEY_RSA) return "RS256";
+        return "";
+    }
+
+    /* Sign `msg` of `mlen` bytes with `pkey` using SHA-256 as the
+     * digest. Writes the signature to `*out_sig` (GC-allocated)
+     * and the length to `*out_len`. For ES256 the output is
+     * converted from DER(R, S) to raw R||S (64 bytes, RFC 7515).
+     * Returns 1 on success, 0 on failure (out_sig stays NULL). */
+    static int amalgame_crypto_jws_sign(EVP_PKEY* pkey,
+            const uint8_t* msg, size_t mlen,
+            uint8_t** out_sig, size_t* out_len) {
+        *out_sig = NULL; *out_len = 0;
+        if (!pkey) return 0;
+        EVP_MD_CTX* mctx = EVP_MD_CTX_new();
+        if (!mctx) return 0;
+        int ok = 0;
+        uint8_t* raw = NULL;
+        size_t raw_len = 0;
+        do {
+            if (EVP_DigestSignInit(mctx, NULL, EVP_sha256(), NULL, pkey) <= 0) break;
+            if (EVP_DigestSignUpdate(mctx, msg, mlen) <= 0) break;
+            /* Two-pass: first to size, then to fill. */
+            if (EVP_DigestSignFinal(mctx, NULL, &raw_len) <= 0) break;
+            raw = (uint8_t*) GC_MALLOC_ATOMIC(raw_len > 0 ? raw_len : 1);
+            if (EVP_DigestSignFinal(mctx, raw, &raw_len) <= 0) break;
+            ok = 1;
+        } while (0);
+        EVP_MD_CTX_free(mctx);
+        if (!ok) return 0;
+
+        int id = EVP_PKEY_id(pkey);
+        if (id == EVP_PKEY_EC) {
+            /* DER → raw R||S. Each component is 32 bytes for P-256
+             * (zero-padded on the left if the BIGNUM has fewer
+             * bytes — RFC 7515 §3.4 is strict about length). */
+            const uint8_t* p = raw;
+            ECDSA_SIG* sig = d2i_ECDSA_SIG(NULL, &p, (long) raw_len);
+            if (!sig) return 0;
+            const BIGNUM* r = NULL;
+            const BIGNUM* s = NULL;
+            ECDSA_SIG_get0(sig, &r, &s);
+            uint8_t* fixed = (uint8_t*) GC_MALLOC_ATOMIC(64);
+            memset(fixed, 0, 64);
+            int rlen = BN_num_bytes(r);
+            int slen = BN_num_bytes(s);
+            if (rlen > 32 || slen > 32) { ECDSA_SIG_free(sig); return 0; }
+            BN_bn2bin(r, fixed + (32 - rlen));
+            BN_bn2bin(s, fixed + 64 - slen);
+            ECDSA_SIG_free(sig);
+            *out_sig = fixed;
+            *out_len = 64;
+            return 1;
+        }
+        /* RSA: raw is already PKCS#1 v1.5; pass through. */
+        *out_sig = raw;
+        *out_len = raw_len;
+        return 1;
+    }
+
+    /* Verify `sig` against `msg`. For ES256 expects raw R||S (64 bytes)
+     * input — converts to DER internally. For RS256 expects PKCS#1
+     * v1.5 padded. Returns 1 on valid, 0 on invalid or any error. */
+    static int amalgame_crypto_jws_verify(EVP_PKEY* pkey,
+            const uint8_t* msg, size_t mlen,
+            const uint8_t* sig, size_t sig_len) {
+        if (!pkey) return 0;
+        int id = EVP_PKEY_id(pkey);
+        uint8_t* der = NULL;
+        long der_len_l = 0;
+
+        const uint8_t* verify_sig = sig;
+        size_t verify_len = sig_len;
+
+        if (id == EVP_PKEY_EC) {
+            /* Raw R||S → DER. */
+            if (sig_len != 64) return 0;
+            BIGNUM* r = BN_bin2bn(sig, 32, NULL);
+            BIGNUM* s = BN_bin2bn(sig + 32, 32, NULL);
+            if (!r || !s) { BN_free(r); BN_free(s); return 0; }
+            ECDSA_SIG* es = ECDSA_SIG_new();
+            if (!es) { BN_free(r); BN_free(s); return 0; }
+            /* ECDSA_SIG_set0 takes ownership of r,s — no free below. */
+            ECDSA_SIG_set0(es, r, s);
+            int dlen = i2d_ECDSA_SIG(es, &der);
+            if (dlen <= 0) { ECDSA_SIG_free(es); return 0; }
+            der_len_l = dlen;
+            ECDSA_SIG_free(es);
+            verify_sig = der;
+            verify_len = (size_t) der_len_l;
+        }
+
+        EVP_MD_CTX* mctx = EVP_MD_CTX_new();
+        if (!mctx) { if (der) OPENSSL_free(der); return 0; }
+        int ok = 0;
+        do {
+            if (EVP_DigestVerifyInit(mctx, NULL, EVP_sha256(), NULL, pkey) <= 0) break;
+            if (EVP_DigestVerifyUpdate(mctx, msg, mlen) <= 0) break;
+            if (EVP_DigestVerifyFinal(mctx, verify_sig, verify_len) == 1) ok = 1;
+        } while (0);
+        EVP_MD_CTX_free(mctx);
+        if (der) OPENSSL_free(der);
+        return ok;
+    }
+
+    /* Build the JWK JSON for the public half of an EC P-256 key.
+     * RFC 7517 §4 + RFC 7518 §6.2.1. Output canonical form (sorted
+     * keys, no whitespace) — the spec is loose, but ACME servers
+     * compute the thumbprint over what they get, so the canonical
+     * form is the safe choice. Returns "" on non-EC keys / failure. */
+    static code_string amalgame_crypto_jws_jwk_ec(EVP_PKEY* pkey) {
+        if (!pkey || EVP_PKEY_id(pkey) != EVP_PKEY_EC) return "";
+        EC_KEY* eckey = EVP_PKEY_get0_EC_KEY(pkey);
+        if (!eckey) return "";
+        const EC_POINT* pub = EC_KEY_get0_public_key(eckey);
+        const EC_GROUP* grp = EC_KEY_get0_group(eckey);
+        if (!pub || !grp) return "";
+        BIGNUM* x = BN_new();
+        BIGNUM* y = BN_new();
+        if (!x || !y) { BN_free(x); BN_free(y); return ""; }
+        code_string out = "";
+        do {
+            if (1 != EC_POINT_get_affine_coordinates(grp, pub, x, y, NULL)) break;
+            uint8_t xb[32], yb[32];
+            memset(xb, 0, 32); memset(yb, 0, 32);
+            int xlen = BN_num_bytes(x);
+            int ylen = BN_num_bytes(y);
+            if (xlen > 32 || ylen > 32) break;
+            BN_bn2bin(x, xb + (32 - xlen));
+            BN_bn2bin(y, yb + (32 - ylen));
+            /* Inline base64url to avoid an AM ↔ C round-trip. */
+            static const char alpha[] =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            char xb64[64]; char yb64[64];
+            for (int side = 0; side < 2; side++) {
+                const uint8_t* src = side ? yb : xb;
+                char* dst = side ? yb64 : xb64;
+                int oi = 0;
+                for (int i = 0; i < 30; i += 3) {
+                    uint32_t v = ((uint32_t)src[i] << 16)
+                               | ((uint32_t)src[i+1] << 8)
+                               |  (uint32_t)src[i+2];
+                    dst[oi++] = alpha[(v >> 18) & 0x3F];
+                    dst[oi++] = alpha[(v >> 12) & 0x3F];
+                    dst[oi++] = alpha[(v >>  6) & 0x3F];
+                    dst[oi++] = alpha[ v        & 0x3F];
+                }
+                /* Last 2 bytes (positions 30..31): 16 bits → 3 chars. */
+                uint32_t v = ((uint32_t)src[30] << 16)
+                           | ((uint32_t)src[31] << 8);
+                dst[oi++] = alpha[(v >> 18) & 0x3F];
+                dst[oi++] = alpha[(v >> 12) & 0x3F];
+                dst[oi++] = alpha[(v >>  6) & 0x3F];
+                dst[oi] = 0;
+            }
+            /* Canonical JWK: keys sorted (crv, kty, x, y). */
+            const char* fmt = "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"%s\",\"y\":\"%s\"}";
+            size_t need = strlen(fmt) + strlen(xb64) + strlen(yb64) + 1;
+            char* j = (char*) GC_MALLOC(need);
+            snprintf(j, need, fmt, xb64, yb64);
+            out = j;
+        } while (0);
+        BN_free(x); BN_free(y);
+        return out;
+    }
+
+    /* JWK JSON for the public half of an RSA key. RFC 7518 §6.3.1
+     * — keys: e, kty, n (sorted). Modulus + exponent base64url-
+     * encoded, no leading zero byte. */
+    static code_string amalgame_crypto_jws_jwk_rsa(EVP_PKEY* pkey) {
+        if (!pkey || EVP_PKEY_id(pkey) != EVP_PKEY_RSA) return "";
+        RSA* rsa = EVP_PKEY_get0_RSA(pkey);
+        if (!rsa) return "";
+        const BIGNUM* n = NULL; const BIGNUM* e = NULL;
+        RSA_get0_key(rsa, &n, &e, NULL);
+        if (!n || !e) return "";
+        int nlen = BN_num_bytes(n);
+        int elen = BN_num_bytes(e);
+        if (nlen <= 0 || elen <= 0) return "";
+        uint8_t* nb = (uint8_t*) GC_MALLOC_ATOMIC((size_t) nlen);
+        uint8_t* eb = (uint8_t*) GC_MALLOC_ATOMIC((size_t) elen);
+        BN_bn2bin(n, nb);
+        BN_bn2bin(e, eb);
+        static const char alpha[] =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        /* b64url with no padding, into GC-alloc'd buffers. */
+        size_t nb64_max = 4 * ((nlen + 2) / 3) + 1;
+        size_t eb64_max = 4 * ((elen + 2) / 3) + 1;
+        char* nb64 = (char*) GC_MALLOC(nb64_max);
+        char* eb64 = (char*) GC_MALLOC(eb64_max);
+        for (int side = 0; side < 2; side++) {
+            const uint8_t* src = side ? eb : nb;
+            char* dst        = side ? eb64 : nb64;
+            int len = side ? elen : nlen;
+            int oi = 0;
+            int i = 0;
+            while (i + 3 <= len) {
+                uint32_t v = ((uint32_t)src[i] << 16)
+                           | ((uint32_t)src[i+1] << 8)
+                           |  (uint32_t)src[i+2];
+                dst[oi++] = alpha[(v >> 18) & 0x3F];
+                dst[oi++] = alpha[(v >> 12) & 0x3F];
+                dst[oi++] = alpha[(v >>  6) & 0x3F];
+                dst[oi++] = alpha[ v        & 0x3F];
+                i += 3;
+            }
+            int rem = len - i;
+            if (rem == 1) {
+                uint32_t v = (uint32_t)src[i] << 16;
+                dst[oi++] = alpha[(v >> 18) & 0x3F];
+                dst[oi++] = alpha[(v >> 12) & 0x3F];
+            } else if (rem == 2) {
+                uint32_t v = ((uint32_t)src[i] << 16)
+                           | ((uint32_t)src[i+1] << 8);
+                dst[oi++] = alpha[(v >> 18) & 0x3F];
+                dst[oi++] = alpha[(v >> 12) & 0x3F];
+                dst[oi++] = alpha[(v >>  6) & 0x3F];
+            }
+            dst[oi] = 0;
+        }
+        const char* fmt = "{\"e\":\"%s\",\"kty\":\"RSA\",\"n\":\"%s\"}";
+        size_t need = strlen(fmt) + strlen(nb64) + strlen(eb64) + 1;
+        char* j = (char*) GC_MALLOC(need);
+        snprintf(j, need, fmt, eb64, nb64);
+        return j;
+    }
 }
 
 public class Sha256 {
@@ -447,6 +775,92 @@ public class Bytes {
         @c {
             size_t len; uint8_t* buf = amalgame_crypto_list_to_bytes(b, &len);
             out = amalgame_crypto_bytes_to_hex(buf, len);
+        }
+        return out
+    }
+
+    // Base64url (RFC 7515 §3 / RFC 4648 §5) — URL-safe alphabet
+    // (- and _ instead of + and /), NO padding. The encoding used
+    // by JWS (signing input concatenation), JWT, ACME (everywhere),
+    // WebAuthn challenges, and modern URL-embedded crypto. Use the
+    // padded Base64 variants if you need RFC 4648 §4.
+    public static string ToBase64Url(b: List<int>) {
+        var out: string = ""
+        @c {
+            size_t len; uint8_t* buf = amalgame_crypto_list_to_bytes(b, &len);
+            /* 4*ceil(n/3) chars, plus 1 NUL. Worst case n=0 → 1 byte. */
+            size_t out_max = 4 * ((len + 2) / 3) + 1;
+            char* o = (char*) GC_MALLOC(out_max);
+            static const char alpha[] =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            size_t oi = 0;
+            size_t i = 0;
+            while (i + 3 <= len) {
+                uint32_t v = ((uint32_t)buf[i] << 16)
+                           | ((uint32_t)buf[i+1] << 8)
+                           |  (uint32_t)buf[i+2];
+                o[oi++] = alpha[(v >> 18) & 0x3F];
+                o[oi++] = alpha[(v >> 12) & 0x3F];
+                o[oi++] = alpha[(v >>  6) & 0x3F];
+                o[oi++] = alpha[ v        & 0x3F];
+                i += 3;
+            }
+            size_t rem = len - i;
+            if (rem == 1) {
+                uint32_t v = (uint32_t)buf[i] << 16;
+                o[oi++] = alpha[(v >> 18) & 0x3F];
+                o[oi++] = alpha[(v >> 12) & 0x3F];
+            } else if (rem == 2) {
+                uint32_t v = ((uint32_t)buf[i] << 16)
+                           | ((uint32_t)buf[i+1] << 8);
+                o[oi++] = alpha[(v >> 18) & 0x3F];
+                o[oi++] = alpha[(v >> 12) & 0x3F];
+                o[oi++] = alpha[(v >>  6) & 0x3F];
+            }
+            o[oi] = 0;
+            out = o;
+        }
+        return out
+    }
+
+    // Parse a base64url string into bytes. Accepts both no-padding
+    // and padded ("====") variants. Returns an empty list on any
+    // non-alphabet character.
+    public static List<int> FromBase64Url(s: string) {
+        var out: List<int> = new List<int>()
+        @c {
+            if (!s) s = "";
+            size_t n = strlen(s);
+            /* Strip optional '=' padding. */
+            while (n > 0 && s[n-1] == '=') n--;
+            /* Each 4 chars → 3 bytes. Last block can be 2 chars → 1 byte
+             * or 3 chars → 2 bytes. */
+            size_t out_max = (n / 4) * 3 + 2;
+            if (out_max < 1) out_max = 1;
+            uint8_t* buf = (uint8_t*) GC_MALLOC_ATOMIC(out_max);
+            size_t bi = 0;
+            uint32_t acc = 0;
+            int bits = 0;
+            int ok = 1;
+            for (size_t i = 0; i < n; i++) {
+                char c = s[i];
+                int v;
+                if      (c >= 'A' && c <= 'Z') v = c - 'A';
+                else if (c >= 'a' && c <= 'z') v = c - 'a' + 26;
+                else if (c >= '0' && c <= '9') v = c - '0' + 52;
+                else if (c == '-') v = 62;
+                else if (c == '_') v = 63;
+                else { ok = 0; break; }
+                acc = (acc << 6) | (uint32_t)v;
+                bits += 6;
+                if (bits >= 8) {
+                    bits -= 8;
+                    buf[bi++] = (uint8_t)((acc >> bits) & 0xFFu);
+                }
+            }
+            if (ok) {
+                out = amalgame_crypto_bytes_to_list(buf, bi);
+            }
         }
         return out
     }
@@ -620,5 +1034,178 @@ public class Aead {
         let ct: List<int> = new List<int>()
         for j in 12..n { ct.Add(bundle.Get(j)) }
         return Aead.OpenAes256Gcm(key, nonce, aad, ct)
+    }
+}
+
+// ── JwsKey (v0.3.0) ──────────────────────────────────────
+//
+// EVP_PKEY-backed signing key for JWS (JSON Web Signature,
+// RFC 7515). Two algorithms today, both required by ACME (RFC 8555):
+//
+//   ES256 — ECDSA P-256 + SHA-256 (RFC 7518 §3.4). The default —
+//           keys are small, signatures are short, and most ACME
+//           CAs (Let's Encrypt, ZeroSSL) prefer it.
+//   RS256 — RSASSA-PKCS1-v1_5 with SHA-256 (RFC 7518 §3.3).
+//           Use when interoperating with legacy clients that lack
+//           EC support. RSA-2048 (the modern floor).
+//
+// Lifetime: the underlying EVP_PKEY lives for the program's lifetime
+// — we don't EVP_PKEY_free at the AM boundary. ACME apps create
+// one account key per process so this bounded leak is acceptable.
+//
+// Persistence: serialize via ToPemPrivate() → store to disk →
+// FromPemPrivate(loadedString) on next launch. The PEM is unencrypted
+// PKCS#8 — protect the file at rest (mode 0600 + restricted dir).
+//
+// Sign / Verify wire format (RFC 7515-compliant):
+//   ES256 — raw R||S (64 bytes), NOT DER. Convert with care if
+//           inter-op with non-JWS code expects DER.
+//   RS256 — PKCS#1 v1.5 (256 bytes for RSA-2048).
+//
+// Use case — ACME account JWS signing:
+//
+//   let k = JwsKey.GenerateEs256()
+//   let payload: List<int> = Bytes.FromString(jsonBody)
+//   let signed: List<int> = k.Sign(payload)
+//   let b64 = Bytes.ToBase64Url(signed)
+//   ... build JWS protected header + payload + signature ...
+public class JwsKey {
+    public Handle: int        // opaque EVP_PKEY* cast to i64
+    public Algo:   string     // "ES256" | "RS256"
+
+    public JwsKey() {
+        this.Handle = 0
+        this.Algo   = ""
+    }
+
+    // ── Generation ──────────────────────────────────────
+    // Fresh ES256 (P-256 ECDSA) keypair. Returns a JwsKey with
+    // Handle = 0 on failure (rare — OpenSSL out-of-memory or
+    // entropy starvation).
+    public static JwsKey GenerateEs256() {
+        let k = new JwsKey()
+        @c {
+            EVP_PKEY* pkey = amalgame_crypto_jws_gen_es256();
+            if (pkey) {
+                k->Handle = (int64_t)(intptr_t) pkey;
+                k->Algo = "ES256";
+            }
+        }
+        return k
+    }
+
+    // Fresh RS256 (RSA-2048) keypair. Generation is slow (~50-200ms
+    // depending on hardware) because it needs to find a 2048-bit
+    // prime. Cache the key; don't regenerate per-request.
+    public static JwsKey GenerateRs256() {
+        let k = new JwsKey()
+        @c {
+            EVP_PKEY* pkey = amalgame_crypto_jws_gen_rs256();
+            if (pkey) {
+                k->Handle = (int64_t)(intptr_t) pkey;
+                k->Algo = "RS256";
+            }
+        }
+        return k
+    }
+
+    // ── PEM round-trip ──────────────────────────────────
+    public static JwsKey FromPemPrivate(pem: string) {
+        let k = new JwsKey()
+        @c {
+            EVP_PKEY* pkey = amalgame_crypto_jws_from_pem(pem);
+            if (pkey) {
+                k->Handle = (int64_t)(intptr_t) pkey;
+                k->Algo = amalgame_crypto_jws_algorithm(pkey);
+            }
+        }
+        return k
+    }
+
+    public string ToPemPrivate() {
+        var out: string = ""
+        let h: int = this.Handle
+        @c {
+            EVP_PKEY* pkey = (EVP_PKEY*)(intptr_t) h;
+            out = amalgame_crypto_jws_to_pem(pkey);
+        }
+        return out
+    }
+
+    // ── Identification ──────────────────────────────────
+    // "ES256", "RS256", or "" for an unloaded / failed key.
+    public string Algorithm() {
+        return this.Algo
+    }
+
+    // True when this key is loaded and ready to sign.
+    public bool IsValid() {
+        return this.Handle != 0 && String_Length(this.Algo) > 0
+    }
+
+    // ── JWK (RFC 7517) ─────────────────────────────────
+    // JSON Web Key — public-half only, canonical encoding (keys
+    // sorted, no whitespace). Goes into ACME "protected"."jwk" on
+    // newAccount requests; from then on you use "kid" (the account
+    // URL) instead, but the JWK shape stays fixed for the lifetime
+    // of the account.
+    //
+    // Returns "" if the key isn't loaded.
+    public string JwkPublic() {
+        var out: string = ""
+        let h: int = this.Handle
+        @c {
+            EVP_PKEY* pkey = (EVP_PKEY*)(intptr_t) h;
+            if (!pkey) {
+                /* leave empty */
+            } else if (EVP_PKEY_id(pkey) == EVP_PKEY_EC) {
+                out = amalgame_crypto_jws_jwk_ec(pkey);
+            } else if (EVP_PKEY_id(pkey) == EVP_PKEY_RSA) {
+                out = amalgame_crypto_jws_jwk_rsa(pkey);
+            }
+        }
+        return out
+    }
+
+    // RFC 7638 JWK thumbprint — base64url(SHA-256(canonical JWK)).
+    // Used by ACME http-01 challenge: keyAuthorization = token + "." + thumbprint.
+    public string ThumbprintBase64Url() {
+        let jwk: string = this.JwkPublic()
+        if (String_Length(jwk) == 0) { return "" }
+        let bytes: List<int> = Bytes.FromString(jwk)
+        let digest: List<int> = Sha256.Bytes(bytes)
+        return Bytes.ToBase64Url(digest)
+    }
+
+    // ── Sign / Verify ──────────────────────────────────
+    // Sign `msg` and return the JWS-format signature.
+    // Returns empty list on any failure (invalid key, OpenSSL error).
+    public List<int> Sign(msg: List<int>) {
+        var out: List<int> = new List<int>()
+        let h: int = this.Handle
+        @c {
+            EVP_PKEY* pkey = (EVP_PKEY*)(intptr_t) h;
+            size_t mlen; uint8_t* mbuf = amalgame_crypto_list_to_bytes(msg, &mlen);
+            uint8_t* sigb = NULL; size_t slen = 0;
+            if (amalgame_crypto_jws_sign(pkey, mbuf, mlen, &sigb, &slen)) {
+                out = amalgame_crypto_bytes_to_list(sigb, slen);
+            }
+        }
+        return out
+    }
+
+    // Verify a JWS-format signature. Returns false on any failure.
+    public bool Verify(msg: List<int>, sig: List<int>) {
+        var ok: bool = false
+        let h: int = this.Handle
+        @c {
+            EVP_PKEY* pkey = (EVP_PKEY*)(intptr_t) h;
+            size_t mlen; uint8_t* mbuf = amalgame_crypto_list_to_bytes(msg, &mlen);
+            size_t slen; uint8_t* sbuf = amalgame_crypto_list_to_bytes(sig, &slen);
+            if (amalgame_crypto_jws_verify(pkey, mbuf, mlen, sbuf, slen)) {
+                ok = 1;
+            }
+        }
+        return ok
     }
 }

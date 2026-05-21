@@ -11,6 +11,7 @@ namespace UserApp
 
 import Amalgame.Crypto
 import Amalgame.Collections
+import Amalgame.String
 
 public class Program {
     public static void Main() {
@@ -210,6 +211,112 @@ public class Program {
             Console.WriteLine("[PASS] aead auto short bundle rejected")
         } else {
             Console.WriteLine("[FAIL] aead auto accepted short bundle")
+        }
+
+        // ── Base64url round-trip (v0.3.0) ─────────────
+        // RFC 4648 §10 vectors, just URL-alphabet
+        // "" → ""; "f" → "Zg"; "fo" → "Zm8"; "foo" → "Zm9v"; "foob" → "Zm9vYg"
+        let v1: string = Bytes.ToBase64Url(Bytes.FromString(""))
+        let v2: string = Bytes.ToBase64Url(Bytes.FromString("f"))
+        let v3: string = Bytes.ToBase64Url(Bytes.FromString("fo"))
+        let v4: string = Bytes.ToBase64Url(Bytes.FromString("foo"))
+        let v5: string = Bytes.ToBase64Url(Bytes.FromString("foob"))
+        if (v1 == "" && v2 == "Zg" && v3 == "Zm8" && v4 == "Zm9v" && v5 == "Zm9vYg") {
+            Console.WriteLine("[PASS] base64url RFC 4648 vectors")
+        } else {
+            Console.WriteLine("[FAIL] base64url: " + v1 + "|" + v2 + "|" + v3 + "|" + v4 + "|" + v5)
+        }
+        // Round-trip a random-looking byte string
+        let payload: List<int> = Bytes.FromString("hello, world ?#$%^&*()_+-=")
+        let encoded: string = Bytes.ToBase64Url(payload)
+        let decoded: List<int> = Bytes.FromBase64Url(encoded)
+        let back: string = Bytes.ToString(decoded)
+        if (back == "hello, world ?#$%^&*()_+-=") {
+            Console.WriteLine("[PASS] base64url roundtrip")
+        } else {
+            Console.WriteLine("[FAIL] base64url roundtrip got: " + back)
+        }
+
+        // ── JwsKey ES256 generate + sign + verify ─────
+        let kE = JwsKey.GenerateEs256()
+        if (kE.IsValid() && kE.Algorithm() == "ES256") {
+            Console.WriteLine("[PASS] jws es256 generate")
+        } else {
+            Console.WriteLine("[FAIL] jws es256 generate: " + kE.Algorithm())
+        }
+
+        let msgE: List<int> = Bytes.FromString("hello JWS")
+        let sigE: List<int> = kE.Sign(msgE)
+        if (sigE.Count() == 64) {
+            Console.WriteLine("[PASS] jws es256 sig length 64")
+        } else {
+            Console.WriteLine("[FAIL] jws es256 sig length: " + String_FromInt(sigE.Count()))
+        }
+        if (kE.Verify(msgE, sigE)) {
+            Console.WriteLine("[PASS] jws es256 verify")
+        } else {
+            Console.WriteLine("[FAIL] jws es256 verify rejected own sig")
+        }
+        // Tampered message must fail
+        let msgEt: List<int> = Bytes.FromString("hello JWZ")
+        if (!kE.Verify(msgEt, sigE)) {
+            Console.WriteLine("[PASS] jws es256 tamper rejected")
+        } else {
+            Console.WriteLine("[FAIL] jws es256 accepted tampered msg")
+        }
+
+        // ── JWK + Thumbprint ─────────────────────────
+        let jwkE: string = kE.JwkPublic()
+        // Canonical order: crv, kty, x, y. Quick shape check.
+        if (String_StartsWith(jwkE, "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":\"")
+            && String_Contains(jwkE, "\",\"y\":\"")
+            && String_EndsWith(jwkE, "\"}")) {
+            Console.WriteLine("[PASS] jws es256 jwk canonical shape")
+        } else {
+            Console.WriteLine("[FAIL] jws es256 jwk: " + jwkE)
+        }
+        let tp: string = kE.ThumbprintBase64Url()
+        // base64url(SHA-256(jwk)) is always 43 chars (256 / 6 = 42.67 → 43).
+        if (String_Length(tp) == 43) {
+            Console.WriteLine("[PASS] jws es256 thumbprint length 43")
+        } else {
+            Console.WriteLine("[FAIL] jws es256 thumbprint length: " + String_FromInt(String_Length(tp)))
+        }
+
+        // ── PEM round-trip ───────────────────────────
+        let pemE: string = kE.ToPemPrivate()
+        if (String_StartsWith(pemE, "-----BEGIN PRIVATE KEY-----")) {
+            Console.WriteLine("[PASS] jws es256 pem header")
+        } else {
+            Console.WriteLine("[FAIL] jws es256 pem header: " + pemE)
+        }
+        let kE2 = JwsKey.FromPemPrivate(pemE)
+        if (kE2.IsValid() && kE2.Algorithm() == "ES256") {
+            // Verify the loaded key produces same JWK (same public half)
+            if (kE2.JwkPublic() == jwkE) {
+                Console.WriteLine("[PASS] jws es256 pem roundtrip")
+            } else {
+                Console.WriteLine("[FAIL] jws es256 pem roundtrip jwk drift")
+            }
+        } else {
+            Console.WriteLine("[FAIL] jws es256 pem reload: " + kE2.Algorithm())
+        }
+
+        // ── RS256 quick smoke (genkey + sign + verify only) ──
+        // Skip the JWK-shape assertion for RSA — modulus length
+        // is fine but we don't pin specific bytes here.
+        let kR = JwsKey.GenerateRs256()
+        if (kR.IsValid() && kR.Algorithm() == "RS256") {
+            let msgR: List<int> = Bytes.FromString("rsa wins")
+            let sigR: List<int> = kR.Sign(msgR)
+            // RSA-2048 → 256-byte signature
+            if (sigR.Count() == 256 && kR.Verify(msgR, sigR)) {
+                Console.WriteLine("[PASS] jws rs256 sign+verify")
+            } else {
+                Console.WriteLine("[FAIL] jws rs256 sign+verify: len=" + String_FromInt(sigR.Count()))
+            }
+        } else {
+            Console.WriteLine("[FAIL] jws rs256 generate: " + kR.Algorithm())
         }
     }
 }
