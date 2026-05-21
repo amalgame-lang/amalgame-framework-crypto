@@ -19,7 +19,7 @@ jobs:
         # (PR #377 on amalgame-lang/Amalgame). The first compatible
         # release tag — initially v0.7.6 — gets added here once
         # amc v0.7.6 ships.
-        amc-tag: [v0.7.6]
+        amc-tag: [v0.8.38]
     steps:
       - name: Checkout package
         uses: actions/checkout@v4
