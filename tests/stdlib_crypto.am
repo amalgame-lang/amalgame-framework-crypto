@@ -318,5 +318,64 @@ public class Program {
         } else {
             Console.WriteLine("[FAIL] jws rs256 generate: " + kR.Algorithm())
         }
+
+        // ── Password hashing (scrypt, v0.4.0) ────────────────
+        let pw: string = "correct horse battery staple"
+        let ph: string = Password.Hash(pw)
+        if (String_StartsWith(ph, "$scrypt$ln=15,r=8,p=1$")) {
+            Console.WriteLine("[PASS] password hash format")
+        } else {
+            Console.WriteLine("[FAIL] password hash format got '" + ph + "'")
+        }
+        if (Password.Verify(pw, ph)) {
+            Console.WriteLine("[PASS] password verify correct")
+        } else {
+            Console.WriteLine("[FAIL] password verify correct rejected")
+        }
+        if (!Password.Verify("wrong password", ph)) {
+            Console.WriteLine("[PASS] password verify wrong rejected")
+        } else {
+            Console.WriteLine("[FAIL] password verify wrong accepted")
+        }
+        // Same password hashed twice → different salt → different string.
+        let ph2: string = Password.Hash(pw)
+        if (ph != ph2) {
+            Console.WriteLine("[PASS] password salt randomized")
+        } else {
+            Console.WriteLine("[FAIL] password salt not randomized")
+        }
+        // The password still verifies against the second hash.
+        if (Password.Verify(pw, ph2)) {
+            Console.WriteLine("[PASS] password verify 2nd hash")
+        } else {
+            Console.WriteLine("[FAIL] password verify 2nd hash rejected")
+        }
+        // Malformed encoded string → false, no crash.
+        if (!Password.Verify(pw, "not-a-valid-hash")) {
+            Console.WriteLine("[PASS] password malformed rejected")
+        } else {
+            Console.WriteLine("[FAIL] password malformed accepted")
+        }
+
+        // ── Constant-time compare (G3) ───────────────────────
+        let ctA: List<int> = Bytes.FromString("super-secret-token")
+        let ctB: List<int> = Bytes.FromString("super-secret-token")
+        let ctC: List<int> = Bytes.FromString("super-secret-tokeX")
+        let ctD: List<int> = Bytes.FromString("short")
+        if (Bytes.ConstantTimeEquals(ctA, ctB)) {
+            Console.WriteLine("[PASS] ct-equals match")
+        } else {
+            Console.WriteLine("[FAIL] ct-equals match rejected")
+        }
+        if (!Bytes.ConstantTimeEquals(ctA, ctC)) {
+            Console.WriteLine("[PASS] ct-equals one-byte diff")
+        } else {
+            Console.WriteLine("[FAIL] ct-equals accepted a diff")
+        }
+        if (!Bytes.ConstantTimeEquals(ctA, ctD)) {
+            Console.WriteLine("[PASS] ct-equals length mismatch")
+        } else {
+            Console.WriteLine("[FAIL] ct-equals accepted length mismatch")
+        }
     }
 }
