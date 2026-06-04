@@ -739,6 +739,31 @@ public class Hmac {
 // returns an empty list on malformed input (odd length, non-hex
 // char); callers detect this by checking Count() against the
 // expected output length.
+
+// C helpers shared by Bytes.ConstantTimeEquals and the Password class.
+// Defined here (before both) so the generated C sees the declarations.
+@c {
+    /* scrypt KDF (OpenSSL 3.0 EVP_PBE_scrypt). N = 2^logN, cost params
+     * r, p. Writes outlen bytes to out. Returns 1 on success, 0 on
+     * failure / bad params. */
+    static int amalgame_crypto_scrypt(const char* pass, size_t passlen,
+            const uint8_t* salt, size_t saltlen,
+            uint64_t logN, uint64_t r, uint64_t p,
+            uint8_t* out, size_t outlen) {
+        if (logN < 1 || logN > 31 || r < 1 || p < 1) return 0;
+        uint64_t N = (uint64_t)1 << logN;
+        uint64_t maxmem = (uint64_t)1024 * 1024 * 1024; /* 1 GiB headroom */
+        return EVP_PBE_scrypt(pass, passlen, salt, saltlen,
+                              N, r, p, maxmem, out, outlen) == 1;
+    }
+    /* Constant-time equality of two equal-length byte buffers. */
+    static int amalgame_crypto_ct_eq(const uint8_t* a, const uint8_t* b, size_t n) {
+        unsigned char d = 0;
+        for (size_t i = 0; i < n; i++) d |= (unsigned char)(a[i] ^ b[i]);
+        return d == 0;
+    }
+}
+
 public class Bytes {
     public Bytes() {}
 
@@ -897,6 +922,24 @@ public class Bytes {
             }
         }
         return out
+    }
+
+    // Constant-time equality of two byte lists. Use this to compare
+    // secrets (MACs, tokens, password-hash outputs) — a normal `==`
+    // / per-byte loop leaks where the first difference is via timing,
+    // which can let an attacker recover the secret byte by byte. Length
+    // is treated as public (returns false immediately on a length
+    // mismatch); only the content comparison is constant-time.
+    public static bool ConstantTimeEquals(a: List<int>, b: List<int>) {
+        var ok: bool = false
+        @c {
+            size_t alen; uint8_t* abuf = amalgame_crypto_list_to_bytes(a, &alen);
+            size_t blen; uint8_t* bbuf = amalgame_crypto_list_to_bytes(b, &blen);
+            if (alen == blen && alen > 0 && amalgame_crypto_ct_eq(abuf, bbuf, alen)) {
+                ok = 1;
+            }
+        }
+        return ok
     }
 }
 
@@ -1207,5 +1250,111 @@ public class JwsKey {
             }
         }
         return ok
+    }
+}
+
+// ── Password hashing (v0.4.0) ───────────────────────────────────────
+// Memory-hard password hashing. Backend is scrypt (OpenSSL 3.0
+// EVP_PBE_scrypt) — Argon2id needs OpenSSL 3.2+ EVP_KDF or libargon2,
+// neither guaranteed yet; the Password.Hash/Verify API is intentionally
+// backend-agnostic so it can swap to Argon2id without breaking callers.
+// (The scrypt + constant-time C helpers are defined above, before the
+// Bytes class, so both Bytes.ConstantTimeEquals and Password see them.)
+public class Password {
+    public Password() {}
+
+    // Hash `password` with scrypt and a fresh 16-byte random salt.
+    // Returns a self-describing string that carries the parameters and
+    // salt so Verify() needs nothing else:
+    //   $scrypt$ln=15,r=8,p=1$<salt_b64url>$<hash_b64url>
+    // ln=15 → N=2^15 (~32 MiB), a balanced 2026 default. Never store the
+    // raw password; store only this string.
+    public static string Hash(string password) {
+        let logN: int = 15
+        let r:    int = 8
+        let p:    int = 1
+        let salt: List<int> = Password.randomBytes(16)
+        let hash: List<int> = Password.scryptDerive(password, salt, logN, r, p, 32)
+        return "$scrypt$ln=" + String_FromInt(logN) + ",r=" + String_FromInt(r)
+            + ",p=" + String_FromInt(p) + "$" + Bytes.ToBase64Url(salt)
+            + "$" + Bytes.ToBase64Url(hash)
+    }
+
+    // Verify `password` against a string produced by Hash(). Re-derives
+    // with the embedded params + salt and compares in constant time.
+    // Returns false on any parse error, unknown scheme, or mismatch.
+    public static bool Verify(string password, string encoded) {
+        let parts: List<string> = Password.split(encoded, "$")
+        // ["", "scrypt", "ln=..,r=..,p=..", "<salt>", "<hash>"]
+        if (parts.Count() != 5) { return false }
+        if (parts.Get(1) != "scrypt") { return false }
+        let prm: List<string> = Password.split(parts.Get(2), ",")
+        if (prm.Count() != 3) { return false }
+        let logN: int = Password.kv(prm.Get(0), "ln")
+        let r:    int = Password.kv(prm.Get(1), "r")
+        let p:    int = Password.kv(prm.Get(2), "p")
+        if (logN < 1 || r < 1 || p < 1) { return false }
+        let salt: List<int> = Bytes.FromBase64Url(parts.Get(3))
+        let want: List<int> = Bytes.FromBase64Url(parts.Get(4))
+        if (want.Count() == 0) { return false }
+        let got: List<int> = Password.scryptDerive(password, salt, logN, r, p, want.Count())
+        if (got.Count() != want.Count()) { return false }
+        return Bytes.ConstantTimeEquals(got, want)
+    }
+
+    // ── internals ───────────────────────────────────────────────────
+
+    static List<int> randomBytes(int n) {
+        var out: List<int> = new List<int>()
+        @c {
+            int nn = (int) n; if (nn < 0) nn = 0;
+            uint8_t* buf = (uint8_t*) GC_MALLOC_ATOMIC((size_t)(nn > 0 ? nn : 1));
+            if (RAND_bytes(buf, nn) == 1) {
+                out = amalgame_crypto_bytes_to_list(buf, (size_t) nn);
+            }
+        }
+        return out
+    }
+
+    static List<int> scryptDerive(string password, salt: List<int>,
+                                  logN: int, r: int, p: int, outlen: int) {
+        var out: List<int> = new List<int>()
+        @c {
+            if (!password) password = "";
+            size_t slen; uint8_t* sbuf = amalgame_crypto_list_to_bytes(salt, &slen);
+            int ol = (int) outlen; if (ol < 1) ol = 1;
+            uint8_t* okbuf = (uint8_t*) GC_MALLOC_ATOMIC((size_t) ol);
+            if (amalgame_crypto_scrypt(password, strlen(password), sbuf, slen,
+                                       (uint64_t) logN, (uint64_t) r, (uint64_t) p,
+                                       okbuf, (size_t) ol)) {
+                out = amalgame_crypto_bytes_to_list(okbuf, (size_t) ol);
+            }
+        }
+        return out
+    }
+
+    // Split `s` on every occurrence of `sep` (no regex). Always returns
+    // at least one element.
+    static List<string> split(string s, sep: string) {
+        var out: List<string> = new List<string>()
+        var rest: string = s
+        let sl: int = String_Length(sep)
+        var idx: int = String_IndexOf(rest, sep)
+        while (idx >= 0 && sl > 0) {
+            out.Add(String_Substring(rest, 0, idx))
+            rest = String_Substring(rest, idx + sl, String_Length(rest) - idx - sl)
+            idx = String_IndexOf(rest, sep)
+        }
+        out.Add(rest)
+        return out
+    }
+
+    // Parse "key=NN" → NN; -1 if the key prefix doesn't match.
+    static int kv(string s, key: string) {
+        let pfx: string = key + "="
+        let pl: int = String_Length(pfx)
+        if (String_Length(s) <= pl) { return -1 }
+        if (String_Substring(s, 0, pl) != pfx) { return -1 }
+        return String_ToInt(String_Substring(s, pl, String_Length(s) - pl))
     }
 }

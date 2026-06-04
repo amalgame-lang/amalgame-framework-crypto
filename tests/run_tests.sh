@@ -213,6 +213,17 @@ run_test "jws es256 pem header"         "[PASS] jws es256 pem header"
 run_test "jws es256 pem roundtrip"      "[PASS] jws es256 pem roundtrip"
 run_test "jws rs256 sign+verify"        "[PASS] jws rs256 sign+verify"
 
+run_test "password hash format"         "[PASS] password hash format"
+run_test "password verify correct"      "[PASS] password verify correct"
+run_test "password verify wrong reject" "[PASS] password verify wrong rejected"
+run_test "password salt randomized"     "[PASS] password salt randomized"
+run_test "password verify 2nd hash"     "[PASS] password verify 2nd hash"
+run_test "password malformed rejected"  "[PASS] password malformed rejected"
+
+run_test "ct-equals match"              "[PASS] ct-equals match"
+run_test "ct-equals one-byte diff"      "[PASS] ct-equals one-byte diff"
+run_test "ct-equals length mismatch"    "[PASS] ct-equals length mismatch"
+
 # ── Cleanup the symlinked build dir to leave the tree clean ──
 rm -f "$WORK_BUILD_DIR"
 
