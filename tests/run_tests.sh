@@ -234,6 +234,10 @@ run_test "jwk import + verify"          "[PASS] jws FromJwkRsa import + verify"
 run_test "jwk rejects tampered input"   "[PASS] jws FromJwkRsa rejects tampered input"
 run_test "jwk rejects bogus modulus"    "[PASS] jws FromJwkRsa rejects bogus modulus"
 
+# ── JwsKey.FromCoseEc2 + SignDer/VerifyDer — WebAuthn (v0.7.0) ──
+run_test "coseec2 + verifyder roundtrip" "[PASS] jws FromCoseEc2 + VerifyDer round-trip"
+run_test "verifyder rejects tampered"    "[PASS] jws VerifyDer rejects tampered assertion"
+
 # ── Cleanup the symlinked build dir to leave the tree clean ──
 rm -f "$WORK_BUILD_DIR"
 

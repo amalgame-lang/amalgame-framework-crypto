@@ -437,6 +437,32 @@ public class Program {
         } else {
             Console.WriteLine("[FAIL] jws FromJwkRsa accepted bogus modulus")
         }
+
+        // ── FromCoseEc2 + SignDer/VerifyDer (WebAuthn assertion) ──
+        // Round-trip: generate ES256, sign in NATIVE DER, export the
+        // public EC coords (JWK x/y), re-import via FromCoseEc2, and
+        // confirm the imported verify-only key validates the DER sig —
+        // exactly how a WebAuthn relying party checks an assertion.
+        let ecJwk: string = kE2.JwkPublic()
+        let xVal: string = Program.jsonField(ecJwk, "x")
+        let yVal: string = Program.jsonField(ecJwk, "y")
+        let pubEc: JwsKey = JwsKey.FromCoseEc2(
+            Bytes.FromBase64Url(xVal), Bytes.FromBase64Url(yVal))
+        let msgWA: List<int> = Bytes.FromString("webauthn assertion signing input")
+        let derSig: List<int> = kE2.SignDer(msgWA)
+        if (pubEc.IsValid() && pubEc.Algorithm() == "ES256"
+            && derSig.Count() > 0 && pubEc.VerifyDer(msgWA, derSig)) {
+            Console.WriteLine("[PASS] jws FromCoseEc2 + VerifyDer round-trip")
+        } else {
+            Console.WriteLine("[FAIL] jws FromCoseEc2 + VerifyDer round-trip")
+        }
+        // A tampered message must NOT verify under the imported EC key.
+        let msgWAbad: List<int> = Bytes.FromString("webauthn assertion signing inpuX")
+        if (!pubEc.VerifyDer(msgWAbad, derSig)) {
+            Console.WriteLine("[PASS] jws VerifyDer rejects tampered assertion")
+        } else {
+            Console.WriteLine("[FAIL] jws VerifyDer accepted tampered assertion")
+        }
     }
 
     // Minimal extractor for a canonical JSON string field `"key":"value"`

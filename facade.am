@@ -454,6 +454,93 @@ import Amalgame.String
         return pkey;
     }
 
+    /* Build an EC P-256 *public* EVP_PKEY from the affine coordinates
+     * `x` / `y` — i.e. the COSE_Key (RFC 8152) EC2 parameters -2 / -3 a
+     * WebAuthn authenticator hands back, or a JWK's `x` / `y`. The key
+     * is public-only (verify, never sign). Coordinates are left-padded
+     * to 32 bytes and packed as an uncompressed point (0x04‖X‖Y). NULL
+     * on any failure (bad length, OpenSSL OOM). */
+    static EVP_PKEY* amalgame_crypto_jws_from_cose_ec2(
+            const uint8_t* x, size_t xl, const uint8_t* y, size_t yl) {
+        if (!x || !y || xl == 0 || yl == 0 || xl > 32 || yl > 32) return NULL;
+        uint8_t pub[65];
+        pub[0] = 0x04;
+        memset(pub + 1, 0, 64);
+        memcpy(pub + 1  + (32 - xl), x, xl);
+        memcpy(pub + 33 + (32 - yl), y, yl);
+        EVP_PKEY* pkey = NULL;
+        OSSL_PARAM_BLD* bld = OSSL_PARAM_BLD_new();
+        OSSL_PARAM* params = NULL;
+        EVP_PKEY_CTX* ctx = NULL;
+        do {
+            if (!bld) break;
+            if (!OSSL_PARAM_BLD_push_utf8_string(bld,
+                    OSSL_PKEY_PARAM_GROUP_NAME, "prime256v1", 0)) break;
+            if (!OSSL_PARAM_BLD_push_octet_string(bld,
+                    OSSL_PKEY_PARAM_PUB_KEY, pub, 65)) break;
+            params = OSSL_PARAM_BLD_to_param(bld);
+            if (!params) break;
+            ctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
+            if (!ctx) break;
+            if (EVP_PKEY_fromdata_init(ctx) <= 0) break;
+            if (EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_PUBLIC_KEY, params) <= 0) {
+                pkey = NULL; break;
+            }
+        } while (0);
+        if (ctx)    EVP_PKEY_CTX_free(ctx);
+        if (params) OSSL_PARAM_free(params);
+        if (bld)    OSSL_PARAM_BLD_free(bld);
+        return pkey;
+    }
+
+    /* Sign `msg` (SHA-256) and emit the signature in the algorithm's
+     * NATIVE encoding — ASN.1 DER (ECDSA-Sig-Value) for EC, PKCS#1
+     * v1.5 for RSA. This is the form X.509 / WebAuthn / COSE use, as
+     * opposed to the raw R‖S that JWS wants. Returns 1 on success. */
+    static int amalgame_crypto_jws_sign_native(EVP_PKEY* pkey,
+            const uint8_t* msg, size_t mlen,
+            uint8_t** out_sig, size_t* out_len) {
+        *out_sig = NULL; *out_len = 0;
+        if (!pkey) return 0;
+        EVP_MD_CTX* mctx = EVP_MD_CTX_new();
+        if (!mctx) return 0;
+        int ok = 0;
+        uint8_t* raw = NULL;
+        size_t raw_len = 0;
+        do {
+            if (EVP_DigestSignInit(mctx, NULL, EVP_sha256(), NULL, pkey) <= 0) break;
+            if (EVP_DigestSignUpdate(mctx, msg, mlen) <= 0) break;
+            if (EVP_DigestSignFinal(mctx, NULL, &raw_len) <= 0) break;
+            raw = (uint8_t*) GC_MALLOC_ATOMIC(raw_len > 0 ? raw_len : 1);
+            if (EVP_DigestSignFinal(mctx, raw, &raw_len) <= 0) break;
+            ok = 1;
+        } while (0);
+        EVP_MD_CTX_free(mctx);
+        if (!ok) return 0;
+        *out_sig = raw;
+        *out_len = raw_len;
+        return 1;
+    }
+
+    /* Verify a NATIVE-encoded signature (DER ECDSA / PKCS#1 RSA) over
+     * `msg` with SHA-256 — the form WebAuthn assertions + X.509 certs
+     * carry. Returns 1 on valid, 0 otherwise. */
+    static int amalgame_crypto_jws_verify_native(EVP_PKEY* pkey,
+            const uint8_t* msg, size_t mlen,
+            const uint8_t* sig, size_t siglen) {
+        if (!pkey) return 0;
+        EVP_MD_CTX* mctx = EVP_MD_CTX_new();
+        if (!mctx) return 0;
+        int ok = 0;
+        do {
+            if (EVP_DigestVerifyInit(mctx, NULL, EVP_sha256(), NULL, pkey) <= 0) break;
+            if (EVP_DigestVerifyUpdate(mctx, msg, mlen) <= 0) break;
+            if (EVP_DigestVerifyFinal(mctx, sig, siglen) == 1) ok = 1;
+        } while (0);
+        EVP_MD_CTX_free(mctx);
+        return ok;
+    }
+
     /* Detect whether an EVP_PKEY is EC (→ ES256) or RSA (→ RS256).
      * Returns "ES256", "RS256", or "" for anything else. */
     static code_string amalgame_crypto_jws_algorithm(EVP_PKEY* pkey) {
@@ -1312,6 +1399,26 @@ public class JwsKey {
         return k
     }
 
+    // Build a verify-only ES256 (P-256) key from the COSE_Key EC2
+    // coordinates an authenticator returns — the `x` (-2) and `y` (-3)
+    // affine-point byte strings. This is the primitive a WebAuthn
+    // relying party needs to check an assertion signature. Pass the
+    // raw 32-byte coordinates (left-padding is handled). Handle = 0
+    // (IsValid() == false) on any failure.
+    public static JwsKey FromCoseEc2(xBytes: List<int>, yBytes: List<int>) {
+        let k = new JwsKey()
+        @c {
+            size_t xl; uint8_t* xb = amalgame_crypto_list_to_bytes(xBytes, &xl);
+            size_t yl; uint8_t* yb = amalgame_crypto_list_to_bytes(yBytes, &yl);
+            EVP_PKEY* pkey = amalgame_crypto_jws_from_cose_ec2(xb, xl, yb, yl);
+            if (pkey) {
+                k->Handle = (int64_t)(intptr_t) pkey;
+                k->Algo   = "ES256";
+            }
+        }
+        return k
+    }
+
     // ── Identification ──────────────────────────────────
     // "ES256", "RS256", or "" for an unloaded / failed key.
     public string Algorithm() {
@@ -1383,6 +1490,40 @@ public class JwsKey {
             size_t mlen; uint8_t* mbuf = amalgame_crypto_list_to_bytes(msg, &mlen);
             size_t slen; uint8_t* sbuf = amalgame_crypto_list_to_bytes(sig, &slen);
             if (amalgame_crypto_jws_verify(pkey, mbuf, mlen, sbuf, slen)) {
+                ok = 1;
+            }
+        }
+        return ok
+    }
+
+    // Sign `msg` and return the signature in the algorithm's NATIVE
+    // encoding — ASN.1 DER (ECDSA) for ES256, PKCS#1 v1.5 for RS256 —
+    // the form X.509 / WebAuthn / COSE use (vs Sign()'s raw R‖S JWS).
+    public List<int> SignDer(msg: List<int>) {
+        var out: List<int> = new List<int>()
+        let h: int = this.Handle
+        @c {
+            EVP_PKEY* pkey = (EVP_PKEY*)(intptr_t) h;
+            size_t mlen; uint8_t* mbuf = amalgame_crypto_list_to_bytes(msg, &mlen);
+            uint8_t* sigb = NULL; size_t slen = 0;
+            if (amalgame_crypto_jws_sign_native(pkey, mbuf, mlen, &sigb, &slen)) {
+                out = amalgame_crypto_bytes_to_list(sigb, slen);
+            }
+        }
+        return out
+    }
+
+    // Verify a NATIVE-encoded signature (DER ECDSA / PKCS#1 RSA) over
+    // `msg` with SHA-256 — the exact bytes a WebAuthn assertion or an
+    // X.509 certificate carries. Returns false on any failure.
+    public bool VerifyDer(msg: List<int>, sig: List<int>) {
+        var ok: bool = false
+        let h: int = this.Handle
+        @c {
+            EVP_PKEY* pkey = (EVP_PKEY*)(intptr_t) h;
+            size_t mlen; uint8_t* mbuf = amalgame_crypto_list_to_bytes(msg, &mlen);
+            size_t slen; uint8_t* sbuf = amalgame_crypto_list_to_bytes(sig, &slen);
+            if (amalgame_crypto_jws_verify_native(pkey, mbuf, mlen, sbuf, slen)) {
                 ok = 1;
             }
         }
