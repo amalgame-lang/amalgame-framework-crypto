@@ -17,9 +17,9 @@
 
 [package]
 name              = "amalgame-crypto"
-version           = "0.4.0"
+version           = "0.5.0"
 license           = "Apache-2.0"
-description       = "Crypto facade for Amalgame: SHA-256, HMAC-SHA-256, AES-256-GCM AEAD, ES256/RS256 JWS signing (RFC 7515), and memory-hard password hashing (Password.Hash/Verify, scrypt backend, self-describing $scrypt$ string, constant-time verify)."
+description       = "Crypto facade for Amalgame: SHA-256, HMAC-SHA-256, AES-256-GCM AEAD, ES256/RS256 JWS signing (RFC 7515), memory-hard password hashing (Password.Hash/Verify, scrypt), and TOTP 2FA — HMAC-SHA-1 (Hmac.Sha1), Base32 (RFC 4648), and Totp (RFC 6238: At/Now/Verify, constant-time compare + clock-skew window) compatible with Google Authenticator. Validated against the RFC 6238 test vectors."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.7.6"
 schema-version    = 1
@@ -29,7 +29,7 @@ schema-version    = 1
 # v0.2.0 — Aead + AeadResult (AES-256-GCM via OpenSSL EVP).
 # v0.3.0 — JwsKey (ES256 / RS256 signing + verification for JWS / ACME).
 # v0.4.0 — Password (memory-hard hashing, scrypt backend, constant-time verify).
-classes   = ["Sha256", "Hmac", "Aead", "AeadResult", "Bytes", "JwsKey", "Password"]
+classes   = ["Sha256", "Hmac", "Aead", "AeadResult", "Bytes", "JwsKey", "Password", "Base32", "Totp"]
 header    = "facade-stub.h"
 namespace = "Amalgame.Crypto"
 facade    = "facade.am"

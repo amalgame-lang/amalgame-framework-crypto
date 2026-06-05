@@ -34,6 +34,7 @@ import Amalgame.String
     #include <stdint.h>
     #include <string.h>
     #include <stdio.h>
+    #include <time.h>
     #include <openssl/evp.h>
     #include <openssl/rand.h>
     #include <openssl/ec.h>
@@ -639,6 +640,60 @@ import Amalgame.String
         snprintf(j, need, fmt, eb64, nb64);
         return j;
     }
+
+    /* ── SHA-1 (RFC 3174) + HMAC-SHA-1 — for TOTP (RFC 6238). SHA-1 is
+     * NOT for new signatures; it's here only because TOTP / RFC 4226 are
+     * specified on HMAC-SHA-1 (Google Authenticator et al.). ─────────── */
+    typedef struct { uint32_t h[5]; uint64_t len; uint8_t buf[64]; size_t buflen; } amalgame_crypto_sha1_ctx;
+    static uint32_t amalgame_crypto_rotl32(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
+    static void amalgame_crypto_sha1_init(amalgame_crypto_sha1_ctx* c) {
+        c->h[0]=0x67452301u; c->h[1]=0xEFCDAB89u; c->h[2]=0x98BADCFEu;
+        c->h[3]=0x10325476u; c->h[4]=0xC3D2E1F0u; c->len=0; c->buflen=0;
+    }
+    static void amalgame_crypto_sha1_block(amalgame_crypto_sha1_ctx* c, const uint8_t* p) {
+        uint32_t w[80];
+        for (int i=0;i<16;i++) w[i]=((uint32_t)p[4*i]<<24)|((uint32_t)p[4*i+1]<<16)|((uint32_t)p[4*i+2]<<8)|p[4*i+3];
+        for (int i=16;i<80;i++) w[i]=amalgame_crypto_rotl32(w[i-3]^w[i-8]^w[i-14]^w[i-16],1);
+        uint32_t a=c->h[0],b=c->h[1],cc=c->h[2],d=c->h[3],e=c->h[4];
+        for (int i=0;i<80;i++) {
+            uint32_t f,k;
+            if (i<20){ f=(b&cc)|((~b)&d); k=0x5A827999u; }
+            else if (i<40){ f=b^cc^d; k=0x6ED9EBA1u; }
+            else if (i<60){ f=(b&cc)|(b&d)|(cc&d); k=0x8F1BBCDCu; }
+            else { f=b^cc^d; k=0xCA62C1D6u; }
+            uint32_t t=amalgame_crypto_rotl32(a,5)+f+e+k+w[i];
+            e=d; d=cc; cc=amalgame_crypto_rotl32(b,30); b=a; a=t;
+        }
+        c->h[0]+=a; c->h[1]+=b; c->h[2]+=cc; c->h[3]+=d; c->h[4]+=e;
+    }
+    static void amalgame_crypto_sha1_update(amalgame_crypto_sha1_ctx* c, const uint8_t* data, size_t len) {
+        c->len+=len;
+        while (len) {
+            if (c->buflen==0 && len>=64) { amalgame_crypto_sha1_block(c,data); data+=64; len-=64; continue; }
+            size_t take=64-c->buflen; if (take>len) take=len;
+            memcpy(c->buf+c->buflen,data,take); c->buflen+=take; data+=take; len-=take;
+            if (c->buflen==64) { amalgame_crypto_sha1_block(c,c->buf); c->buflen=0; }
+        }
+    }
+    static void amalgame_crypto_sha1_final(amalgame_crypto_sha1_ctx* c, uint8_t out[20]) {
+        uint64_t bits=c->len*8; uint8_t pad=0x80; amalgame_crypto_sha1_update(c,&pad,1);
+        uint8_t z=0; while (c->buflen!=56) amalgame_crypto_sha1_update(c,&z,1);
+        uint8_t lenbe[8]; for (int i=0;i<8;i++) lenbe[7-i]=(uint8_t)(bits>>(8*i));
+        amalgame_crypto_sha1_update(c,lenbe,8);
+        for (int i=0;i<5;i++) { out[4*i]=(uint8_t)(c->h[i]>>24); out[4*i+1]=(uint8_t)(c->h[i]>>16); out[4*i+2]=(uint8_t)(c->h[i]>>8); out[4*i+3]=(uint8_t)c->h[i]; }
+    }
+    static void amalgame_crypto_sha1_raw(const uint8_t* data, size_t len, uint8_t out[20]) {
+        amalgame_crypto_sha1_ctx c; amalgame_crypto_sha1_init(&c); amalgame_crypto_sha1_update(&c,data,len); amalgame_crypto_sha1_final(&c,out);
+    }
+    static void amalgame_crypto_hmac_sha1_raw(const uint8_t* key, size_t klen, const uint8_t* msg, size_t mlen, uint8_t out[20]) {
+        uint8_t k[64]; memset(k,0,64);
+        if (klen>64) amalgame_crypto_sha1_raw(key,klen,k); else memcpy(k,key,klen);
+        uint8_t ki[64],ko[64]; for (int i=0;i<64;i++) { ki[i]=k[i]^0x36; ko[i]=k[i]^0x5c; }
+        amalgame_crypto_sha1_ctx c; uint8_t inner[20];
+        amalgame_crypto_sha1_init(&c); amalgame_crypto_sha1_update(&c,ki,64); amalgame_crypto_sha1_update(&c,msg,mlen); amalgame_crypto_sha1_final(&c,inner);
+        amalgame_crypto_sha1_init(&c); amalgame_crypto_sha1_update(&c,ko,64); amalgame_crypto_sha1_update(&c,inner,20); amalgame_crypto_sha1_final(&c,out);
+    }
+    static int64_t amalgame_crypto_unix_now(void) { return (int64_t) time(NULL); }
 }
 
 public class Sha256 {
@@ -696,6 +751,20 @@ public class Hmac {
             uint8_t digest[32];
             amalgame_crypto_hmac_sha256_raw(kbuf, klen, mbuf, mlen, digest);
             out = amalgame_crypto_bytes_to_list(digest, 32);
+        }
+        return out
+    }
+
+    // HMAC-SHA-1 (20 bytes). For TOTP / RFC 4226 only — not for new
+    // message authentication (use Sha256 for that).
+    public static List<int> Sha1(key: List<int>, msg: List<int>) {
+        var out: List<int> = new List<int>()
+        @c {
+            size_t klen; uint8_t* kbuf = amalgame_crypto_list_to_bytes(key, &klen);
+            size_t mlen; uint8_t* mbuf = amalgame_crypto_list_to_bytes(msg, &mlen);
+            uint8_t digest[20];
+            amalgame_crypto_hmac_sha1_raw(kbuf, klen, mbuf, mlen, digest);
+            out = amalgame_crypto_bytes_to_list(digest, 20);
         }
         return out
     }
@@ -1356,5 +1425,108 @@ public class Password {
         if (String_Length(s) <= pl) { return -1 }
         if (String_Substring(s, 0, pl) != pfx) { return -1 }
         return String_ToInt(String_Substring(s, pl, String_Length(s) - pl))
+    }
+}
+
+// RFC 4648 Base32 — used for TOTP shared secrets (Google Authenticator
+// encodes the secret in base32).
+public class Base32 {
+    // Decode a base32 string (A-Z 2-7, case-insensitive; '=' padding and
+    // spaces ignored). Returns the bytes; an invalid character yields an
+    // empty list (fail closed).
+    public static List<int> Decode(string s) {
+        var out: List<int> = new List<int>()
+        var buffer: int = 0
+        var bits: int = 0
+        let n: int = String_Length(s)
+        var i: int = 0
+        while (i < n) {
+            let ch: string = String_CharAt1(s, i)
+            i = i + 1
+            if (ch == "=" || ch == " ") { } else {
+                let v: int = Base32.charVal(ch)
+                if (v < 0) { return new List<int>() }
+                buffer = (((buffer << 5)) | v)
+                bits = bits + 5
+                if (bits >= 8) {
+                    bits = bits - 8
+                    out.Add((((buffer >> bits)) & 255))
+                }
+            }
+        }
+        return out
+    }
+    static int charVal(string ch) {
+        let up: int = String_IndexOf("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", ch)
+        if (up >= 0) { return up }
+        let lo: int = String_IndexOf("abcdefghijklmnopqrstuvwxyz", ch)
+        if (lo >= 0) { return lo }
+        return -1
+    }
+}
+
+// TOTP — RFC 6238 time-based one-time passwords (HMAC-SHA-1), compatible
+// with Google Authenticator / Authy. Pair with a per-user base32 secret.
+public class Totp {
+    // The code for a given UNIX time. `digits` is usually 6, `periodSec` 30.
+    public static string At(string secretBase32, int unixTime, int digits, int periodSec) {
+        let secret: List<int> = Base32.Decode(secretBase32)
+        let counter: int = unixTime / periodSec
+        var msg: List<int> = new List<int>()
+        var b: int = 7
+        while (b >= 0) {
+            msg.Add((((counter >> ((8 * b)))) & 255))
+            b = b - 1
+        }
+        let mac: List<int> = Hmac.Sha1(secret, msg)
+        let offset: int = (mac.Get(19) & 15)
+        let p0: int = (mac.Get(offset) & 127)
+        let p1: int = mac.Get(offset + 1)
+        let p2: int = mac.Get(offset + 2)
+        let p3: int = mac.Get(offset + 3)
+        let bin: int = (((p0 << 24)) | ((p1 << 16)) | ((p2 << 8)) | p3)
+        var modn: int = 1
+        var k: int = 0
+        while (k < digits) { modn = modn * 10; k = k + 1 }
+        let otp: int = (bin % modn)
+        return Totp.pad(otp, digits)
+    }
+    // The code for the current time.
+    public static string Now(string secretBase32, int digits, int periodSec) {
+        var t: int = 0
+        @c { t = (long long) amalgame_crypto_unix_now(); }
+        return Totp.At(secretBase32, t, digits, periodSec)
+    }
+    // Verify a submitted code, allowing ±skewSteps periods for clock
+    // drift. Constant-time compare (no early exit) to avoid leaking which
+    // window matched / a partial-prefix timing side channel.
+    public static bool Verify(string secretBase32, string code, int digits, int periodSec, int skewSteps) {
+        var t: int = 0
+        @c { t = (long long) amalgame_crypto_unix_now(); }
+        var ok: bool = false
+        var d: int = (0 - skewSteps)
+        while (d <= skewSteps) {
+            let cand: string = Totp.At(secretBase32, t + ((d * periodSec)), digits, periodSec)
+            if (Totp.ctEquals(cand, code)) { ok = true }
+            d = d + 1
+        }
+        return ok
+    }
+    static bool ctEquals(string a, string b) {
+        let la: int = String_Length(a)
+        let lb: int = String_Length(b)
+        if (la != lb) { return false }
+        var diff: int = 0
+        var i: int = 0
+        while (i < la) {
+            if (String_CharAt1(a, i) != String_CharAt1(b, i)) { diff = (diff | 1) }
+            i = i + 1
+        }
+        return diff == 0
+    }
+    static string pad(int v, int digits) {
+        var s: string = String_FromInt(v)
+        while (String_Length(s) < digits) { s = "0" + s }
+        return s
     }
 }
