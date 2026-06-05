@@ -42,6 +42,8 @@ import Amalgame.String
     #include <openssl/bn.h>
     #include <openssl/pem.h>
     #include <openssl/err.h>
+    #include <openssl/param_build.h>
+    #include <openssl/core_names.h>
 
     /* SHA-256 core (FIPS 180-4 §6.2). Block size 64 bytes,
      * output 32 bytes, 8×32-bit state words H0..H7. */
@@ -405,6 +407,50 @@ import Amalgame.String
         if (!bio) return NULL;
         EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
         BIO_free(bio);
+        return pkey;
+    }
+
+    /* Build an RSA *public* EVP_PKEY from the raw modulus (`nbuf`)
+     * and exponent (`ebuf`) bytes — i.e. the base64url-decoded `n`
+     * and `e` of a JWK (RFC 7517 §6.3.1 / RFC 7518 §6.3). The key is
+     * public-only: it can verify a signature but never sign. Used to
+     * check an OIDC id_token against the IdP's published JWKS.
+     *
+     * EVP_PKEY_fromdata copies the BIGNUM contents into the key, so
+     * n/e are freed here unconditionally. Returns NULL on any failure
+     * (bad decode, OpenSSL OOM) — the caller treats NULL as "untrusted". */
+    static EVP_PKEY* amalgame_crypto_jws_from_jwk_rsa(
+            const uint8_t* nbuf, size_t nlen,
+            const uint8_t* ebuf, size_t elen) {
+        if (!nbuf || !ebuf || nlen == 0 || elen == 0) return NULL;
+        /* Reject absurd moduli early — a JWKS that hands us a 16384-bit
+         * "RSA key" is a DoS lever, not a real signer. 2048..8192 bits
+         * (256..1024 bytes) covers every real-world IdP. */
+        if (nlen < 256 || nlen > 1024) return NULL;
+        BIGNUM* n = BN_bin2bn(nbuf, (int) nlen, NULL);
+        BIGNUM* e = BN_bin2bn(ebuf, (int) elen, NULL);
+        if (!n || !e) { BN_free(n); BN_free(e); return NULL; }
+        EVP_PKEY* pkey = NULL;
+        OSSL_PARAM_BLD* bld = OSSL_PARAM_BLD_new();
+        OSSL_PARAM* params = NULL;
+        EVP_PKEY_CTX* ctx = NULL;
+        do {
+            if (!bld) break;
+            if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_N, n)) break;
+            if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_RSA_E, e)) break;
+            params = OSSL_PARAM_BLD_to_param(bld);
+            if (!params) break;
+            ctx = EVP_PKEY_CTX_new_from_name(NULL, "RSA", NULL);
+            if (!ctx) break;
+            if (EVP_PKEY_fromdata_init(ctx) <= 0) break;
+            if (EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_PUBLIC_KEY, params) <= 0) {
+                pkey = NULL; break;
+            }
+        } while (0);
+        if (ctx)    EVP_PKEY_CTX_free(ctx);
+        if (params) OSSL_PARAM_free(params);
+        if (bld)    OSSL_PARAM_BLD_free(bld);
+        BN_free(n); BN_free(e);
         return pkey;
     }
 
@@ -1242,6 +1288,28 @@ public class JwsKey {
             out = amalgame_crypto_jws_to_pem(pkey);
         }
         return out
+    }
+
+    // ── JWK import (verify-only) ────────────────────────
+    // Build an RS256 public key from a JWK's modulus + exponent —
+    // the base64url-decoded `n` and `e` an OIDC provider publishes at
+    // its `jwks_uri`. The result can ONLY verify (no private half), so
+    // it's safe to hand an untrusted JWKS document to: a forged key
+    // can't sign anything the IdP would, and a bogus/oversized modulus
+    // yields Handle = 0 (IsValid() == false). Pass the bytes via
+    // `Bytes.FromBase64Url(jwk_n)` / `Bytes.FromBase64Url(jwk_e)`.
+    public static JwsKey FromJwkRsa(nBytes: List<int>, eBytes: List<int>) {
+        let k = new JwsKey()
+        @c {
+            size_t nlen; uint8_t* nb = amalgame_crypto_list_to_bytes(nBytes, &nlen);
+            size_t elen; uint8_t* eb = amalgame_crypto_list_to_bytes(eBytes, &elen);
+            EVP_PKEY* pkey = amalgame_crypto_jws_from_jwk_rsa(nb, nlen, eb, elen);
+            if (pkey) {
+                k->Handle = (int64_t)(intptr_t) pkey;
+                k->Algo   = "RS256";
+            }
+        }
+        return k
     }
 
     // ── Identification ──────────────────────────────────

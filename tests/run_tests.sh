@@ -224,6 +224,16 @@ run_test "ct-equals match"              "[PASS] ct-equals match"
 run_test "ct-equals one-byte diff"      "[PASS] ct-equals one-byte diff"
 run_test "ct-equals length mismatch"    "[PASS] ct-equals length mismatch"
 
+# ── TOTP / 2FA (RFC 6238) — v0.5.0 ──
+run_test "totp 8-digit vectors"         "[PASS] totp rfc6238 8-digit vectors"
+run_test "totp 6-digit vector"          "[PASS] totp 6-digit (287082)"
+run_test "totp verify"                  "[PASS] totp verify (current ok, 000000 rejected)"
+
+# ── JwsKey.FromJwkRsa — JWK n/e import for OIDC (v0.6.0) ──
+run_test "jwk import + verify"          "[PASS] jws FromJwkRsa import + verify"
+run_test "jwk rejects tampered input"   "[PASS] jws FromJwkRsa rejects tampered input"
+run_test "jwk rejects bogus modulus"    "[PASS] jws FromJwkRsa rejects bogus modulus"
+
 # ── Cleanup the symlinked build dir to leave the tree clean ──
 rm -f "$WORK_BUILD_DIR"
 

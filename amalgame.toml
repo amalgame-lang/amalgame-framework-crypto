@@ -17,9 +17,9 @@
 
 [package]
 name              = "amalgame-crypto"
-version           = "0.5.0"
+version           = "0.6.0"
 license           = "Apache-2.0"
-description       = "Crypto facade for Amalgame: SHA-256, HMAC-SHA-256, AES-256-GCM AEAD, ES256/RS256 JWS signing (RFC 7515), memory-hard password hashing (Password.Hash/Verify, scrypt), and TOTP 2FA — HMAC-SHA-1 (Hmac.Sha1), Base32 (RFC 4648), and Totp (RFC 6238: At/Now/Verify, constant-time compare + clock-skew window) compatible with Google Authenticator. Validated against the RFC 6238 test vectors."
+description       = "Crypto facade for Amalgame: SHA-256, HMAC-SHA-256, AES-256-GCM AEAD, ES256/RS256 JWS signing (RFC 7515), memory-hard password hashing (Password.Hash/Verify, scrypt), and TOTP 2FA — HMAC-SHA-1 (Hmac.Sha1), Base32 (RFC 4648), and Totp (RFC 6238: At/Now/Verify, constant-time compare + clock-skew window) compatible with Google Authenticator. v0.6.0 adds JwsKey.FromJwkRsa(n, e) — build a verify-only RS256 public key from a JWK's base64url modulus + exponent (EVP_PKEY_fromdata), the primitive an OIDC client needs to check an id_token against the IdP's published JWKS; the key can only verify (never sign), and an out-of-range modulus (outside 2048..8192 bits) is refused as a DoS guard. Validated against the RFC 6238 test vectors and an RSA JWK round-trip (export public JWK → re-import n/e → verify a real signature, reject tampered input)."
 authors           = ["Bastien Mouget"]
 required-amalgame = ">=0.7.6"
 schema-version    = 1

@@ -406,5 +406,49 @@ public class Program {
         } else {
             Console.WriteLine("[FAIL] totp verify")
         }
+
+        // ── FromJwkRsa: import a public key from JWK n/e (OIDC) ──
+        // Round-trip: generate RS256, export its public JWK, re-import
+        // the modulus+exponent, and confirm the imported (verify-only)
+        // key validates a signature the private half produced — the
+        // exact path an OIDC id_token check walks against a live JWKS.
+        let jwk: string = kR.JwkPublic()
+        let nVal: string = Program.jsonField(jwk, "n")
+        let eVal: string = Program.jsonField(jwk, "e")
+        let pub: JwsKey = JwsKey.FromJwkRsa(Bytes.FromBase64Url(nVal), Bytes.FromBase64Url(eVal))
+        let msgJ: List<int> = Bytes.FromString("oidc id_token signing input")
+        let sigJ: List<int> = kR.Sign(msgJ)
+        if (pub.IsValid() && pub.Algorithm() == "RS256" && pub.Verify(msgJ, sigJ)) {
+            Console.WriteLine("[PASS] jws FromJwkRsa import + verify")
+        } else {
+            Console.WriteLine("[FAIL] jws FromJwkRsa import + verify")
+        }
+        // A tampered signing input must NOT verify under the imported key.
+        let msgBad: List<int> = Bytes.FromString("oidc id_token signing inpuX")
+        if (!pub.Verify(msgBad, sigJ)) {
+            Console.WriteLine("[PASS] jws FromJwkRsa rejects tampered input")
+        } else {
+            Console.WriteLine("[FAIL] jws FromJwkRsa accepted tampered input")
+        }
+        // A garbage / undersized modulus → Handle 0, never a usable key.
+        let bogus: JwsKey = JwsKey.FromJwkRsa(Bytes.FromString("short"), Bytes.FromString("AQAB"))
+        if (!bogus.IsValid()) {
+            Console.WriteLine("[PASS] jws FromJwkRsa rejects bogus modulus")
+        } else {
+            Console.WriteLine("[FAIL] jws FromJwkRsa accepted bogus modulus")
+        }
+    }
+
+    // Minimal extractor for a canonical JSON string field `"key":"value"`
+    // — enough for the canonical JWK shape the test exports (no escapes).
+    static string jsonField(json: string, key: string) {
+        let needle: string = "\"" + key + "\":\""
+        let i: int = String_IndexOf(json, needle)
+        if (i < 0) { return "" }
+        let start: int = i + String_Length(needle)
+        let rest: string = String_Substring(json, start, String_Length(json) - start)
+        let end: int = String_IndexOf(rest, "\"")
+        if (end < 0) { return rest }
+        return String_Substring(rest, 0, end)
     }
 }
