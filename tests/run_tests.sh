@@ -237,6 +237,10 @@ run_test "jwk rejects bogus modulus"    "[PASS] jws FromJwkRsa rejects bogus mod
 # ── JwsKey.FromCoseEc2 + SignDer/VerifyDer — WebAuthn (v0.7.0) ──
 run_test "coseec2 + verifyder roundtrip" "[PASS] jws FromCoseEc2 + VerifyDer round-trip"
 run_test "verifyder rejects tampered"    "[PASS] jws VerifyDer rejects tampered assertion"
+# ── v0.8.0 — ECDH P-256 + AES-128-GCM (Web Push) ───────
+run_test "ecdh public raw 65 bytes"      "[PASS] ecdh public raw is 65 bytes"
+run_test "ecdh shared secret matches"    "[PASS] ecdh shared secret matches both ways (32 bytes)"
+run_test "aes128gcm seal length"         "[PASS] aes128gcm seal length = pt + 16"
 
 # ── Cleanup the symlinked build dir to leave the tree clean ──
 rm -f "$WORK_BUILD_DIR"
