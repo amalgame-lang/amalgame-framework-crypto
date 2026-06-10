@@ -463,6 +463,41 @@ public class Program {
         } else {
             Console.WriteLine("[FAIL] jws VerifyDer accepted tampered assertion")
         }
+
+        // ── v0.8.0: ECDH P-256 + AES-128-GCM (Web Push) ──
+        let ea: Ecdh = Ecdh.GenerateP256()
+        let eb: Ecdh = Ecdh.GenerateP256()
+        let eaPub: List<int> = ea.PublicRaw()
+        let ebPub: List<int> = eb.PublicRaw()
+        if (eaPub.Count() == 65 && ebPub.Count() == 65) {
+            Console.WriteLine("[PASS] ecdh public raw is 65 bytes")
+        } else {
+            Console.WriteLine("[FAIL] ecdh public len " + String_FromInt(eaPub.Count()) + "/" + String_FromInt(ebPub.Count()))
+        }
+        // ECDH(a_priv, b_pub) MUST equal ECDH(b_priv, a_pub).
+        let es1: List<int> = ea.Derive(ebPub)
+        let es2: List<int> = eb.Derive(eaPub)
+        var ecdhOk: bool = es1.Count() == 32 && es2.Count() == 32
+        if (ecdhOk) {
+            for i in 0..32 { if (es1.Get(i) != es2.Get(i)) { ecdhOk = false } }
+        }
+        if (ecdhOk) {
+            Console.WriteLine("[PASS] ecdh shared secret matches both ways (32 bytes)")
+        } else {
+            Console.WriteLine("[FAIL] ecdh shared secret mismatch (" + String_FromInt(es1.Count()) + "/" + String_FromInt(es2.Count()) + ")")
+        }
+        // AES-128-GCM seal: output length = plaintext + 16-byte tag.
+        let ak: List<int> = new List<int>()
+        for i in 0..16 { ak.Add(i + 1) }
+        let an: List<int> = new List<int>()
+        for i in 0..12 { an.Add(i) }
+        let apt: List<int> = Bytes.FromString("hello webpush")
+        let act: List<int> = Aead.SealAes128Gcm(ak, an, new List<int>(), apt)
+        if (act.Count() == apt.Count() + 16) {
+            Console.WriteLine("[PASS] aes128gcm seal length = pt + 16")
+        } else {
+            Console.WriteLine("[FAIL] aes128gcm seal len " + String_FromInt(act.Count()))
+        }
     }
 
     // Minimal extractor for a canonical JSON string field `"key":"value"`
